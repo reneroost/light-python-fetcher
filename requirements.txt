@@ -1,0 +1,11 @@
+certifi==2026.6.17
+cffi==2.0.0
+curl_cffi==0.15.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
+packaging==26.2
+pycparser==3.0
+Pygments==2.20.0
+rich==15.0.0
+setuptools==82.0.1
+wheel==0.47.0
