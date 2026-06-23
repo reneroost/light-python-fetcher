@@ -1,7 +1,8 @@
 import logging
 import logging.config
+import random
 from contextlib import asynccontextmanager
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 from curl_cffi.requests import AsyncSession
@@ -48,10 +49,19 @@ LOGGING_CONFIG = {
 logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger("light_fetcher")
 
+# Browser fingerprint profiles to cycle when no specific target profile is mandated
+IMPERSONATE_PROFILES: List[String] = [
+    "chrome124", 
+    "chrome120", 
+    "chrome116",
+    "safari17_2", 
+    "safari17_0",
+    "firefox133"
+]
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Optional: logic to run on startup/shutdown
     logger.info("Light Python Fetcher API lifecycle started.")
     yield
     logger.info("Light Python Fetcher API lifecycle terminating.")
@@ -68,7 +78,8 @@ class FetchRequest(BaseModel):
     url: HttpUrl
     proxy_url: Optional[str] = None
     headers: Optional[Dict[str, str]] = None
-    impersonate: Optional[str] = "chrome"
+    # Changed default to None to allow the server-side rotation fallback to kick in
+    impersonate: Optional[str] = None  
     timeout_seconds: Optional[int] = 15
 
 
@@ -87,7 +98,8 @@ async def fetch_page(request: FetchRequest) -> FetchResponse:
         else None
     )
 
-    active_impersonate = request.impersonate or "chrome"
+    # Use the passed profile if available; otherwise, pick randomly to defeat fingerprinting trackers
+    active_impersonate = request.impersonate or random.choice(IMPERSONATE_PROFILES)
     active_timeout = request.timeout_seconds or 15
 
     logger.info(
