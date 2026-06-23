@@ -54,13 +54,13 @@ logger = logging.getLogger("light_fetcher")
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 # Browser fingerprint profiles to cycle when no specific target profile is mandated
-IMPERSONATE_PROFILES: List[str] = [
-    "chrome124", 
-    "chrome120", 
-    "chrome116",
-    "safari17_2", 
-    "safari17_0",
-    "firefox133"
+IMPERSONATE_PROFILES = [
+    "chrome146",
+    "chrome145",
+    "firefox147",
+    "firefox144",
+    "safari2601",
+    "safari260",
 ]
 
 
