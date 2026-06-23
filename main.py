@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.errors import RequestsError
+from charset_normalizer import from_bytes
 
 # Define unified production logging configuration in-code
 LOGGING_CONFIG = {
@@ -142,8 +143,16 @@ async def fetch_page(request: FetchRequest) -> FetchResponse:
                     detail=f"Upstream response too large: {len(content)} bytes"
                 )
 
-            # 3. Decode payload utilizing safe replacement flags to drop malformed byte sequences cleanly
-            decoded_html = content.decode(response.encoding or "utf-8", errors="replace")
+            # 3. Decode payload utilizing safe fallback detection to prevent silent mojibake
+            if response.encoding:
+                decoded_html = content.decode(response.encoding, errors="replace")
+            else:
+                # Fallback to intelligent charset sniffing if headers lacked content-type declarations
+                detection_result = from_bytes(content).best()
+                if detection_result:
+                    decoded_html = str(detection_result)
+                else:
+                    decoded_html = content.decode("utf-8", errors="replace")
 
             return FetchResponse(
                 status_code=response.status_code,
