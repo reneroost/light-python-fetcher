@@ -49,8 +49,12 @@ LOGGING_CONFIG = {
 logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger("light_fetcher")
 
+# Operational Safety Guard: Prevents memory exhaustion from malicious tarpits or runaway payloads.
+# 2 MB safely accommodates rich HTML + massive embedded JSON hydration blocks common on news sites.
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
 # Browser fingerprint profiles to cycle when no specific target profile is mandated
-IMPERSONATE_PROFILES: List[String] = [
+IMPERSONATE_PROFILES: List[str] = [
     "chrome124", 
     "chrome120", 
     "chrome116",
@@ -78,7 +82,6 @@ class FetchRequest(BaseModel):
     url: HttpUrl
     proxy_url: Optional[str] = None
     headers: Optional[Dict[str, str]] = None
-    # Changed default to None to allow the server-side rotation fallback to kick in
     impersonate: Optional[str] = None  
     timeout_seconds: Optional[int] = 15
 
@@ -98,7 +101,6 @@ async def fetch_page(request: FetchRequest) -> FetchResponse:
         else None
     )
 
-    # Use the passed profile if available; otherwise, pick randomly to defeat fingerprinting trackers
     active_impersonate = request.impersonate or random.choice(IMPERSONATE_PROFILES)
     active_timeout = request.timeout_seconds or 15
 
@@ -117,15 +119,45 @@ async def fetch_page(request: FetchRequest) -> FetchResponse:
                 allow_redirects=True,
             )
 
+            # 1. Verify upstream response status codes before validating payload footprint
+            if response.status_code >= 400:
+                logger.warning(
+                    "Upstream returned %s for %s", response.status_code, target_url
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Upstream returned {response.status_code}"
+                )
+
+            # 2. Evaluate raw content size before initiating string decoding memory allocations
+            content = response.content
+            if len(content) > MAX_RESPONSE_BYTES:
+                logger.error(
+                    "Rejected payload from %s. Footprint size: %s bytes exceeds limit threshold.",
+                    target_url,
+                    len(content),
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Upstream response too large: {len(content)} bytes"
+                )
+
+            # 3. Decode payload utilizing safe replacement flags to drop malformed byte sequences cleanly
+            decoded_html = content.decode(response.encoding or "utf-8", errors="replace")
+
             return FetchResponse(
                 status_code=response.status_code,
-                html=response.text,
-                final_url=response.url,
+                html=decoded_html,
+                final_url=str(response.url),
             )
 
     except RequestsError as e:
         logger.error("CurlCffi failed for %s. Reason: %s", target_url, e)
         raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {str(e)}")
+
+    except HTTPException:
+        # Re-raise explicit HTTP exceptions from upstream state or size boundary evaluations
+        raise
 
     except Exception:
         logger.exception("Unexpected error during fetch execution for %s", target_url)
