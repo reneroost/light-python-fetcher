@@ -52,6 +52,9 @@ logger = logging.getLogger("fetcher_service")
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 DEFAULT_IMPERSONATE_PROFILES = ["chrome146", "chrome145", "firefox147", "firefox144", "safari2601", "safari260"]
 
+# Global Pre-Warmed Session Pool
+_sessions: Dict[str, AsyncSession] = {}
+
 
 # --- RFC 7807 Problem Details Schema ---
 class ProblemDetailResponse(BaseModel):
@@ -96,6 +99,15 @@ async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
 
     logger.info("Executing outbound fetch | Target: %s | Profile: %s", target_url, active_impersonate)
 
+    # Resolve session from pre-warmed pool or dynamically fall back to a one-off session
+    session = _sessions.get(active_impersonate)
+    is_one_off = False
+
+    if not session:
+        logger.warning("Profile '%s' missing from pre-warmed pool. Allocating isolated temporary session.", active_impersonate)
+        session = AsyncSession(impersonate=active_impersonate)
+        is_one_off = True
+
     try:
         # curl_cffi owns the full header set. Accept-Language is the only
         # contextual override that's safe to inject without disrupting order.
@@ -106,63 +118,76 @@ async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
                 if k.lower() == "accept-language"
             }
 
-        async with AsyncSession(impersonate=active_impersonate, proxies=proxies) as session:
-            # FIX: Enabled stream=True to prevent automatic full body buffering
-            response = await session.get(
-                target_url,
-                headers=locale_override,
-                timeout=request_dto.timeout_seconds,
-                allow_redirects=True,
-                stream=True,
-            )
+        response = await session.get(
+            target_url,
+            headers=locale_override,
+            timeout=request_dto.timeout_seconds,
+            allow_redirects=True,
+            stream=True,
+            proxies=proxies,
+        )
 
-            if response.status_code >= 400:
-                logger.warning("Upstream peer returned error state %s for %s", response.status_code, target_url)
-                raise UpstreamFetchError(f"Upstream returned status code {response.status_code}", status_code=502)
+        if response.status_code >= 400:
+            logger.warning("Upstream peer returned error state %s for %s", response.status_code, target_url)
+            raise UpstreamFetchError(f"Upstream returned status code {response.status_code}", status_code=502)
 
-            # FIX: Fast-path guard using Content-Length if available
-            try:
-                content_length = int(response.headers.get("Content-Length", 0))
-                if content_length > MAX_RESPONSE_BYTES:
-                    logger.error("Upstream Content-Length exceeds limit: %s bytes", content_length)
-                    raise UpstreamFetchError("Upstream Content-Length exceeds limit", status_code=502)
-            except ValueError:
-                pass  # Malformed header field value, proceed to fallback streaming enforcement
+        try:
+            content_length = int(response.headers.get("Content-Length", 0))
+            if content_length > MAX_RESPONSE_BYTES:
+                logger.error("Upstream Content-Length exceeds limit: %s bytes", content_length)
+                raise UpstreamFetchError("Upstream Content-Length exceeds limit", status_code=502)
+        except ValueError:
+            pass
 
-            # FIX: Stream chunks safely to catch large payloads before memory spikes
-            chunks = []
-            bytes_received = 0
-            async for chunk in response.aiter_content(chunk_size=64 * 1024):
-                bytes_received += len(chunk)
-                if bytes_received > MAX_RESPONSE_BYTES:
-                    logger.error("Payload size violation from %s during streaming (exceeded %s bytes)", target_url, MAX_RESPONSE_BYTES)
-                    raise UpstreamFetchError("Upstream response size limit exceeded", status_code=502)
-                chunks.append(chunk)
+        chunks = []
+        bytes_received = 0
+        async for chunk in response.aiter_content(chunk_size=64 * 1024):
+            bytes_received += len(chunk)
+            if bytes_received > MAX_RESPONSE_BYTES:
+                logger.error("Payload size violation from %s during streaming (exceeded %s bytes)", target_url, MAX_RESPONSE_BYTES)
+                raise UpstreamFetchError("Upstream response size limit exceeded", status_code=502)
+            chunks.append(chunk)
 
-            content = b"".join(chunks)
+        content = b"".join(chunks)
 
-            if response.encoding:
-                decoded_html = content.decode(response.encoding, errors="replace")
-            else:
-                detection_result = from_bytes(content).best()
-                decoded_html = str(detection_result) if detection_result else content.decode("utf-8", errors="replace")
+        if response.encoding:
+            decoded_html = content.decode(response.encoding, errors="replace")
+        else:
+            detection_result = from_bytes(content).best()
+            decoded_html = str(detection_result) if detection_result else content.decode("utf-8", errors="replace")
 
-            return FetchResponse(
-                status_code=response.status_code,
-                html=decoded_html,
-                final_url=str(response.url)
-            )
+        return FetchResponse(
+            status_code=response.status_code,
+            html=decoded_html,
+            final_url=str(response.url)
+        )
 
     except RequestsError as e:
         logger.error("Network driver level failure fetching %s: %s", target_url, str(e))
         raise UpstreamFetchError(f"Network transport layer failure: {str(e)}", status_code=502)
+    finally:
+        if is_one_off:
+            await session.close()
 
 
 # --- Application Lifecycle ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Manages pre-warmed session pools for stable TLS fingerprinting across hot paths."""
+    logger.info("Initializing pre-warmed TLS impersonation session pool...")
+    for profile in DEFAULT_IMPERSONATE_PROFILES:
+        _sessions[profile] = AsyncSession(impersonate=profile)
+    
     logger.info("Fetcher Engine sidecar initialized successfully.")
     yield
+    
+    logger.info("Deallocating TLS session pools and shutting down sidecar cleanly...")
+    for profile, session in _sessions.items():
+        try:
+            await session.close()
+        except Exception as e:
+            logger.error("Failed to close session cleanly for profile %s: %s", profile, str(e))
+    _sessions.clear()
     logger.info("Fetcher Engine sidecar shutting down cleanly.")
 
 
