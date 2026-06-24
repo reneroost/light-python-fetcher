@@ -275,12 +275,13 @@ async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
 
     try:
         # curl_cffi owns the full TLS-fingerprinted header set.
-        # Only Accept-Language is safe to inject without disrupting fingerprint order.
+        # Only Accept-Language and Referer are safe to inject without disrupting fingerprint order.
+        PASSTHROUGH_HEADERS = {"accept-language", "referer"}
         locale_override: Dict[str, str] = {}
         if request_dto.headers:
             locale_override = {
                 k: v for k, v in request_dto.headers.items()
-                if k.lower() == "accept-language"
+                if k.lower() in PASSTHROUGH_HEADERS
             }
 
         response = await session.get(
