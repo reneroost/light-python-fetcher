@@ -72,12 +72,6 @@ class FetchRequest(BaseModel):
     timeout_seconds: int = Field(15, ge=1, le=60, description="Enforced request timeout window")
 
 
-class FetchResponse(BaseModel):
-    status_code: int
-    html: str
-    final_url: str
-
-
 # --- Custom Domain Exceptions ---
 class UpstreamFetchError(Exception):
     """Raised when the upstream target or the network transport layer fails."""
@@ -85,6 +79,12 @@ class UpstreamFetchError(Exception):
         self.detail = detail
         self.status_code = status_code
         super().__init__(self.detail)
+
+
+class FetchResponse(BaseModel):
+    status_code: int
+    html: str
+    final_url: str
 
 
 # --- Core Functional Business Logic ---
@@ -107,21 +107,39 @@ async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
             }
 
         async with AsyncSession(impersonate=active_impersonate, proxies=proxies) as session:
+            # FIX: Enabled stream=True to prevent automatic full body buffering
             response = await session.get(
                 target_url,
                 headers=locale_override,
                 timeout=request_dto.timeout_seconds,
                 allow_redirects=True,
+                stream=True,
             )
 
             if response.status_code >= 400:
                 logger.warning("Upstream peer returned error state %s for %s", response.status_code, target_url)
                 raise UpstreamFetchError(f"Upstream returned status code {response.status_code}", status_code=502)
 
-            content = response.content
-            if len(content) > MAX_RESPONSE_BYTES:
-                logger.error("Payload size violation from %s (%s bytes)", target_url, len(content))
-                raise UpstreamFetchError("Upstream response size limit exceeded", status_code=502)
+            # FIX: Fast-path guard using Content-Length if available
+            try:
+                content_length = int(response.headers.get("Content-Length", 0))
+                if content_length > MAX_RESPONSE_BYTES:
+                    logger.error("Upstream Content-Length exceeds limit: %s bytes", content_length)
+                    raise UpstreamFetchError("Upstream Content-Length exceeds limit", status_code=502)
+            except ValueError:
+                pass  # Malformed header field value, proceed to fallback streaming enforcement
+
+            # FIX: Stream chunks safely to catch large payloads before memory spikes
+            chunks = []
+            bytes_received = 0
+            async for chunk in response.aiter_content(chunk_size=64 * 1024):
+                bytes_received += len(chunk)
+                if bytes_received > MAX_RESPONSE_BYTES:
+                    logger.error("Payload size violation from %s during streaming (exceeded %s bytes)", target_url, MAX_RESPONSE_BYTES)
+                    raise UpstreamFetchError("Upstream response size limit exceeded", status_code=502)
+                chunks.append(chunk)
+
+            content = b"".join(chunks)
 
             if response.encoding:
                 decoded_html = content.decode(response.encoding, errors="replace")
