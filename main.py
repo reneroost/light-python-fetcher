@@ -62,8 +62,6 @@ logger = logging.getLogger("fetcher_service")
 
 MAX_RESPONSE_BYTES: int = 10 * 1024 * 1024  # 10 MB
 
-# Profiles whose curlCffiName values must stay in sync with the Java BrowserProfile enum.
-# The SidecarProfileValidator Spring bean performs a startup cross-check via /api/v1/profiles.
 DEFAULT_IMPERSONATE_PROFILES: list[str] = [
     "chrome146",
     "chrome145",
@@ -73,11 +71,6 @@ DEFAULT_IMPERSONATE_PROFILES: list[str] = [
     "safari260",
 ]
 _KNOWN_PROFILES: frozenset[str] = frozenset(DEFAULT_IMPERSONATE_PROFILES)
-
-# LRU ceiling for the domain session pool.
-# Realistic worst-case: 6 profiles × N news domains.
-# Each AsyncSession holds a cookie jar + curl handle, roughly 100–200 KB each.
-# At 200 entries the ceiling is ~40 MB — acceptable on any Hetzner VPS tier.
 MAX_DOMAIN_SESSIONS: int = 200
 
 
@@ -88,25 +81,6 @@ MAX_DOMAIN_SESSIONS: int = 200
 class DomainSessionPool:
     """
     LRU-bounded pool of ``AsyncSession`` instances keyed by ``(profile, domain)``.
-
-    **Design goals**
-    - *Realistic history*: each ``(profile, domain)`` pair maintains its own
-      cookie jar across requests, mimicking a genuine returning browser user.
-      Cookies set by ``reuters.com`` are never visible to ``techcrunch.com``.
-    - *Bounded RAM*: an LRU eviction policy caps the number of live sessions at
-      ``max_entries``.  Evicted sessions are closed asynchronously without
-      blocking the hot path.
-    - *Concurrency-safe*: an ``asyncio.Lock`` serialises pool mutations.
-      Concurrent reads of the same ``(profile, domain)`` key after initial
-      creation are safe — both callers receive the same session object, which
-      is fine because ``AsyncSession`` allocates independent curl handles per
-      concurrent request and its internal cookie jar is consistently shared
-      (mirroring multi-tab browser behaviour).
-
-    **RAM profile**
-    At ``max_entries=200`` and ~200 KB per session the ceiling is ~40 MB.
-    Typical news scraper domain sets (10–30 sites × 6 profiles) stay well
-    below 50 sessions, keeping real-world consumption under 10 MB.
     """
 
     def __init__(self, max_entries: int = MAX_DOMAIN_SESSIONS) -> None:
@@ -117,10 +91,6 @@ class DomainSessionPool:
         self._lock: asyncio.Lock = asyncio.Lock()
 
     async def get_or_create(self, profile: str, domain: str) -> AsyncSession:
-        """
-        Returns the existing session for ``(profile, domain)`` or creates a
-        new one, evicting the least-recently-used entry when the pool is full.
-        """
         key = (profile, domain)
         async with self._lock:
             if key in self._pool:
@@ -133,7 +103,6 @@ class DomainSessionPool:
 
             if len(self._pool) > self._max:
                 evicted_key, evicted_session = self._pool.popitem(last=False)
-                # Schedule close outside the lock; fire-and-forget.
                 asyncio.create_task(
                     _close_session_safely(evicted_session),
                     name=f"evict-session-{evicted_key[0]}-{evicted_key[1]}",
@@ -146,7 +115,6 @@ class DomainSessionPool:
             return session
 
     async def close_all(self) -> None:
-        """Closes every session in the pool sequentially. Called during shutdown."""
         async with self._lock:
             for (profile, domain), session in self._pool.items():
                 logger.debug("Closing domain session: profile=%s domain=%s", profile, domain)
@@ -155,12 +123,10 @@ class DomainSessionPool:
 
     @property
     def size(self) -> int:
-        """Current number of live sessions (not lock-protected; approximate)."""
         return len(self._pool)
 
 
 async def _close_session_safely(session: AsyncSession) -> None:
-    """Best-effort async session close; logs but does not propagate exceptions."""
     try:
         await session.close()
     except Exception as exc:
@@ -168,19 +134,9 @@ async def _close_session_safely(session: AsyncSession) -> None:
 
 
 def _extract_domain(url: str) -> str:
-    """
-    Extracts the ``netloc`` component (host + optional port) from a URL.
-
-    Used as the domain dimension of the session pool key so that cookies are
-    scoped to a single origin and not shared across target news sites.
-    """
     return urlparse(url).netloc
 
 
-# ---------------------------------------------------------------------------
-# Global pool — instantiated at import time; asyncio.Lock is loop-safe from
-# Python 3.10+ when created before the event loop starts.
-# ---------------------------------------------------------------------------
 _domain_session_pool: DomainSessionPool = DomainSessionPool()
 
 
@@ -189,7 +145,6 @@ _domain_session_pool: DomainSessionPool = DomainSessionPool()
 # ---------------------------------------------------------------------------
 
 class ProblemDetailResponse(BaseModel):
-    """Strict RFC 7807 compliant error format for machine-readable API error contexts."""
     type: str = "about:blank"
     title: str
     status: int
@@ -222,8 +177,7 @@ class FetchResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class UpstreamFetchError(Exception):
-    """Raised when the upstream target or the network transport layer fails."""
-
+    """Raised exclusively when infrastructure/transport level network operations fail."""
     def __init__(self, detail: str, status_code: int = 502) -> None:
         self.detail = detail
         self.status_code = status_code
@@ -235,18 +189,6 @@ class UpstreamFetchError(Exception):
 # ---------------------------------------------------------------------------
 
 async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
-    """
-    Core functional orchestrator for executing outbound TLS-spoofed HTTP requests.
-
-    Session resolution strategy:
-    - If the requested impersonation profile is a known profile, a persistent
-      domain-isolated session is retrieved from (or created in) the LRU pool.
-      This preserves a realistic cookie history for each ``(profile, domain)``
-      pair across repeated scrape cycles.
-    - If the profile is unknown (an explicit override not in the default set),
-      a one-off session is created and closed after the request completes.
-      Unknown profiles are intentionally not pooled to prevent unbounded growth.
-    """
     target_url = str(request_dto.url)
     domain = _extract_domain(target_url)
     proxies = (
@@ -274,8 +216,6 @@ async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
         session = await _domain_session_pool.get_or_create(active_impersonate, domain)
 
     try:
-        # curl_cffi owns the full TLS-fingerprinted header set.
-        # Only Accept-Language and Referer are safe to inject without disrupting fingerprint order.
         PASSTHROUGH_HEADERS = {"accept-language", "referer"}
         locale_override: Dict[str, str] = {}
         if request_dto.headers:
@@ -293,14 +233,12 @@ async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
             proxies=proxies,
         )
 
+        # Critique implementation correction: Upstream error codes are no longer intercepted here.
+        # We downstream the content block to give the Spring caller full situational awareness.
         if response.status_code >= 400:
             logger.warning(
-                "Upstream peer returned error state %s for %s",
+                "Upstream peer returned an HTTP error context: %s for %s",
                 response.status_code, target_url,
-            )
-            raise UpstreamFetchError(
-                f"Upstream returned status code {response.status_code}",
-                status_code=502,
             )
 
         try:
@@ -313,7 +251,7 @@ async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
                     "Upstream Content-Length exceeds limit", status_code=502
                 )
         except ValueError:
-            pass  # Missing or non-integer Content-Length header — proceed with streaming guard.
+            pass
 
         chunks: list[bytes] = []
         bytes_received = 0
@@ -364,17 +302,6 @@ async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Manages the domain session pool lifecycle.
-
-    On startup: logs the pool configuration and confirms the service is ready.
-    No sessions are pre-warmed — the pool is demand-driven.  The first request
-    to each ``(profile, domain)`` pair incurs a cold-start TLS handshake; all
-    subsequent requests reuse the pooled session, which is the correct trade-off
-    for a scheduled batch scraper.
-
-    On shutdown: drains and closes all pooled sessions cleanly.
-    """
     logger.info(
         "Fetcher Engine initialised. Domain session pool capacity: %d entries.",
         MAX_DOMAIN_SESSIONS,
@@ -475,7 +402,6 @@ async def universal_exception_handler(request: Request, exc: Exception) -> JSONR
     summary="Fetch target HTML document via TLS fingerprinting.",
 )
 async def fetch_page(request: FetchRequest) -> FetchResponse:
-    """Dispatches payload collection jobs to the underlying curl_cffi implementation layer."""
     return await execute_fetch(request)
 
 
@@ -485,15 +411,9 @@ async def fetch_page(request: FetchRequest) -> FetchResponse:
     summary="List supported impersonation profiles.",
 )
 async def list_profiles() -> list[str]:
-    """
-    Returns all profile names this sidecar supports.
-    Consumed by the Java ``SidecarProfileValidator`` at startup to detect
-    enum drift between the Java ``BrowserProfile`` enum and this sidecar.
-    """
     return sorted(DEFAULT_IMPERSONATE_PROFILES)
 
 
 @app.get("/health", status_code=status.HTTP_200_OK, summary="Liveness check hook.")
 async def health_check() -> dict:
-    """Used for orchestration layer routing validations and Caddy monitoring logs."""
     return {"status": "healthy", "pool_size": _domain_session_pool.size}
