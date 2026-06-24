@@ -4,7 +4,8 @@ import logging.config
 import random
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from typing import Dict, Optional
+from enum import Enum
+from typing import Optional
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request, status
@@ -153,17 +154,90 @@ class ProblemDetailResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Referrer Intent
+# ---------------------------------------------------------------------------
+
+class ReferrerHint(str, Enum):
+    """
+    Semantic navigation origin sent by Spring. The sidecar resolves this into
+    a concrete Referer header value and a consistent Sec-Fetch-Site override,
+    keeping both signals in sync without Spring needing to know curl_cffi internals.
+    """
+    GOOGLE_SEARCH = "google_search"
+    GOOGLE_NEWS   = "google_news"
+    TWITTER       = "twitter"
+    DIRECT        = "direct"
+
+
+_REFERRER_MAP: dict[ReferrerHint, str] = {
+    ReferrerHint.GOOGLE_SEARCH: "https://www.google.com/",
+    ReferrerHint.GOOGLE_NEWS:   "https://news.google.com/",
+    ReferrerHint.TWITTER:       "https://t.co/",
+    ReferrerHint.DIRECT:        "",
+}
+
+
+def build_contextual_headers(
+    locale: str | None,
+    referrer_hint: ReferrerHint | None,
+) -> dict[str, str]:
+    """
+    Builds the minimal header overrides that curl_cffi cannot derive on its own
+    because they depend on request-level context (geographic locale, navigation origin).
+
+    curl_cffi owns the full baseline browser header stack (Accept, Sec-Fetch-Dest,
+    Upgrade-Insecure-Requests, ordering, etc.). This function only overrides headers
+    that are contextually variable per-request and must be internally consistent
+    with each other:
+
+    - ``accept-language``  — derived from proxy exit country; must match apparent IP origin.
+    - ``referer``          — navigation origin; must be consistent with ``sec-fetch-site``.
+    - ``sec-fetch-site``   — set to ``cross-site`` only when a referrer is present;
+                             otherwise left to curl_cffi's default (``none`` for direct nav).
+
+    Never override ``accept-encoding`` — curl_cffi handles decompression internally.
+    """
+    headers: dict[str, str] = {}
+
+    if locale:
+        headers["accept-language"] = locale
+
+    referrer = _REFERRER_MAP.get(referrer_hint or ReferrerHint.DIRECT, "")
+    if referrer:
+        headers["referer"] = referrer
+        # Sec-Fetch-Site must reflect the navigation origin; cross-site is correct
+        # for all supported referrers (Google, Twitter) relative to any news domain.
+        headers["sec-fetch-site"] = "cross-site"
+    # Direct navigation: leave sec-fetch-site to curl_cffi's default ("none").
+
+    return headers
+
+
+# ---------------------------------------------------------------------------
 # Data Transfer Objects
 # ---------------------------------------------------------------------------
 
 class FetchRequest(BaseModel):
     url: HttpUrl = Field(..., description="Target URL to scrape")
     proxy_url: Optional[str] = Field(None, description="Optional upstream proxy gateway URL")
-    headers: Optional[Dict[str, str]] = Field(default_factory=dict)
     impersonate: Optional[str] = Field(
-        None, description="Explicit browser profile override matching Java BrowserProfile enum"
+        None, description="Browser profile override matching Java BrowserProfile enum"
     )
     timeout_seconds: int = Field(15, ge=1, le=60, description="Enforced request timeout window")
+    locale: Optional[str] = Field(
+        None,
+        description=(
+            "BCP-47 locale string for Accept-Language header (e.g. 'et-EE,et;q=0.9,en;q=0.8'). "
+            "Should derive from the proxy exit country to keep IP geolocation and language consistent."
+        ),
+    )
+    referrer_hint: Optional[ReferrerHint] = Field(
+        None,
+        description=(
+            "Semantic navigation origin intent. Resolved by the sidecar into a concrete "
+            "Referer value and a consistent Sec-Fetch-Site override."
+        ),
+    )
 
 
 class FetchResponse(BaseModel):
@@ -199,10 +273,16 @@ async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
     active_impersonate = request_dto.impersonate or random.choice(DEFAULT_IMPERSONATE_PROFILES)
     is_one_off = active_impersonate not in _KNOWN_PROFILES
 
+    # Resolve context-dependent headers that curl_cffi cannot derive independently.
+    # curl_cffi retains full ownership of the baseline browser header stack.
+    contextual_headers = build_contextual_headers(request_dto.locale, request_dto.referrer_hint)
+
     logger.info(
-        "Executing outbound fetch | Target: %s | Profile: %s | Domain session: %s",
+        "Executing outbound fetch | Target: %s | Profile: %s | Locale: %s | Referrer: %s | Domain session: %s",
         target_url,
         active_impersonate,
+        request_dto.locale or "unset",
+        request_dto.referrer_hint.value if request_dto.referrer_hint else "direct",
         "one-off" if is_one_off else f"pooled (pool size: {_domain_session_pool.size})",
     )
 
@@ -216,25 +296,15 @@ async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
         session = await _domain_session_pool.get_or_create(active_impersonate, domain)
 
     try:
-        PASSTHROUGH_HEADERS = {"accept-language", "referer"}
-        locale_override: Dict[str, str] = {}
-        if request_dto.headers:
-            locale_override = {
-                k: v for k, v in request_dto.headers.items()
-                if k.lower() in PASSTHROUGH_HEADERS
-            }
-
         response = await session.get(
             target_url,
-            headers=locale_override,
+            headers=contextual_headers,
             timeout=request_dto.timeout_seconds,
             allow_redirects=True,
             stream=True,
             proxies=proxies,
         )
 
-        # Critique implementation correction: Upstream error codes are no longer intercepted here.
-        # We downstream the content block to give the Spring caller full situational awareness.
         if response.status_code >= 400:
             logger.warning(
                 "Upstream peer returned an HTTP error context: %s for %s",
@@ -317,7 +387,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Light Python Fetcher API",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
     responses={
         500: {"model": ProblemDetailResponse},
