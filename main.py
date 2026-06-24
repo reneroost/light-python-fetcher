@@ -50,7 +50,7 @@ LOGGING_CONFIG = {
 logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger("fetcher_service")
 
-MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 DEFAULT_IMPERSONATE_PROFILES = ["chrome146", "chrome145", "firefox147", "firefox144", "safari2601", "safari260"]
 
 
