@@ -12,7 +12,6 @@ from curl_cffi.requests.errors import RequestsError
 from charset_normalizer import from_bytes
 
 # --- Configuration & Logging ---
-# Explicitly splitting handlers allows us to rewrite Uvicorn's poorly named internal logger
 LOGGING_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -98,10 +97,19 @@ async def execute_fetch(request_dto: FetchRequest) -> FetchResponse:
     logger.info("Executing outbound fetch | Target: %s | Profile: %s", target_url, active_impersonate)
 
     try:
+        # curl_cffi owns the full header set. Accept-Language is the only
+        # contextual override that's safe to inject without disrupting order.
+        locale_override = {}
+        if request_dto.headers:
+            locale_override = {
+                k: v for k, v in request_dto.headers.items()
+                if k.lower() == "accept-language"
+            }
+
         async with AsyncSession(impersonate=active_impersonate, proxies=proxies) as session:
             response = await session.get(
                 target_url,
-                headers=request_dto.headers or {},
+                headers=locale_override,
                 timeout=request_dto.timeout_seconds,
                 allow_redirects=True,
             )
