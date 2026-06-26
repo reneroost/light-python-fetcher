@@ -26,11 +26,13 @@ import asyncio
 import logging
 import os
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from enum import Enum
 from urllib.parse import urlparse
 
 import uvicorn
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestsError, Timeout
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
@@ -42,7 +44,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="curl-cffi-sidecar", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    await _domain_session_pool.close_all()
+
+
+app = FastAPI(title="curl-cffi-sidecar", version="1.0.0", lifespan=lifespan)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -341,9 +350,28 @@ async def execute_fetch(request_dto: CurlCffiFetchRequest) -> CurlCffiFetchRespo
             status_code=response.status_code,
         )
 
+    except Timeout:
+        # Transient: proxy routing delay or target slow to respond.
+        # The Java retry layer handles this — no traceback needed at this level.
+        log.warning(
+            "fetch TIMEOUT  profile=%-10s url=%s",
+            active_profile, request_dto.url,
+        )
+        return CurlCffiFetchResponse(html=None, final_url=None, status_code=502)
+
+    except RequestsError as exc:
+        # Known curl_cffi transport error (connection reset, proxy error, etc.).
+        # Still recoverable via Java retry — log at ERROR without traceback.
+        log.error(
+            "fetch ERR  profile=%-10s url=%s  error=%s",
+            active_profile, request_dto.url, exc,
+        )
+        return CurlCffiFetchResponse(html=None, final_url=None, status_code=502)
+
     except Exception as exc:
+        # Unexpected — not a curl_cffi transport error. Full traceback warranted.
         log.exception(
-            "fetch ERR profile=%-10s url=%s error=%s",
+            "fetch UNEXPECTED  profile=%-10s url=%s  error=%s",
             active_profile, request_dto.url, exc,
         )
         # Return 502 so the Java layer's TargetFetchException path fires and the
@@ -366,13 +394,6 @@ async def get_profiles() -> dict[str, list[str]]:
     BrowserProfile enum and the sidecar's supported set are in sync.
     """
     return {"profiles": sorted(SUPPORTED_IMPERSONATE_PROFILES)}
-
-
-# ── Lifecycle ─────────────────────────────────────────────────────────────────
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    await _domain_session_pool.close_all()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
