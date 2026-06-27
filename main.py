@@ -1,13 +1,13 @@
 """
 curl_cffi sidecar — FastAPI service providing TLS-impersonating HTTP fetches.
 
-VERSION: 1.1.0  (profile probe + Firefox cleanup)
+VERSION: 1.2.0  (Sec-Fetch quartet + TLS extension order randomisation)
 
 The sidecar's sole responsibility is low-level network execution:
   - Maintaining per-(profile, domain, proxy-exit-identity) sessions that carry
     browser-matching TLS fingerprints, cookie jars, and connection pools.
   - Assembling the small set of context-dependent header overrides
-    (Accept-Language, Referer, Sec-Fetch-Site) on top of the profile baseline.
+    (Accept-Language, Referer, Sec-Fetch-*) on top of the profile baseline.
   - Returning raw HTML and upstream HTTP status to the Java layer.
 
 All orchestration (retry logic, challenge detection, proxy session rotation,
@@ -41,6 +41,42 @@ KEY FIX (profile probe, v1.1.0):
   firefox144 has been removed from PROFILE_CANDIDATES: it was never present in
   any curl_cffi release. firefox147 is retained and probed — it was added with
   HTTP/3 fingerprints in curl_cffi 0.15.0; the probe confirms its availability.
+
+KEY FIX (Sec-Fetch quartet, v1.2.0):
+  Previously build_contextual_headers emitted only Sec-Fetch-Site alongside
+  Accept-Language and an optional Referer. A real top-level Chrome navigation
+  always sends four Sec-Fetch-* headers as a coherent unit:
+
+    Sec-Fetch-Site: <context-dependent — driven by ReferrerHint>
+    Sec-Fetch-Mode: navigate
+    Sec-Fetch-User: ?1
+    Sec-Fetch-Dest: document
+
+  Sec-Fetch-Mode, Sec-Fetch-User, and Sec-Fetch-Dest are constant for every
+  top-level page fetch regardless of referrer or country — they are not
+  context-dependent and could not have been sent from the Java side without
+  adding dead wire fields to the DTO. Emitting only Sec-Fetch-Site while
+  omitting the other three produces a partial Sec-Fetch context that real
+  Chrome never emits, which is a detectable anomaly for vendors that inspect
+  HTTP/2 header presence as a unit (Cloudflare, DataDome). All four are now
+  always emitted together.
+
+  Sec-Fetch-User: ?1 warrants a note: real Chrome emits this only on
+  user-initiated top-level navigations. A programmatic session.get() is not
+  user-initiated, but sending ?1 is the lesser anomaly — omitting it while
+  sending the other three is a partial set that real Chrome never produces.
+  The full quartet is the only pattern a browser actually emits.
+
+KEY FIX (TLS extension order randomisation, v1.2.0):
+  AsyncSession is now constructed with extra_fp={"tls_permute_extensions": True}.
+  Modern Chrome randomises ClientHello extension order per connection; a
+  static extension sequence across all requests from the same session is
+  itself a fingerprint that JA3 (and partial JA4) inspection can flag.
+  tls_permute_extensions instructs curl_cffi's underlying BoringSSL build
+  to shuffle the extension list on each new TLS handshake, matching
+  Chrome's actual per-connection behaviour. This does not affect the JA4
+  hash (JA4 sorts extensions before hashing) but eliminates the static
+  ordering signal visible in raw ClientHello inspection and in JA3.
 """
 from __future__ import annotations
 
@@ -201,7 +237,7 @@ async def lifespan(_: FastAPI):
     await _domain_session_pool.close_all()
 
 
-app = FastAPI(title="curl-cffi-sidecar", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="curl-cffi-sidecar", version="1.2.0", lifespan=lifespan)
 
 # ── DTOs ──────────────────────────────────────────────────────────────────────
 
@@ -256,8 +292,10 @@ _REFERRER_URL: dict[ReferrerHint, str] = {
     ReferrerHint.DIRECT:        "",
 }
 
-# Sec-Fetch-Site is coupled to the referrer — they are always derived from the
-# same ReferrerHint to guarantee they can never disagree.
+# Sec-Fetch-Site is the only Sec-Fetch-* header that varies per request —
+# it is driven by the ReferrerHint. The other three members of the quartet
+# (Mode, User, Dest) are constant for every top-level page navigation and
+# are assembled directly in build_contextual_headers.
 _SEC_FETCH_SITE: dict[ReferrerHint, str] = {
     ReferrerHint.GOOGLE_SEARCH: "cross-site",
     ReferrerHint.GOOGLE_NEWS:   "cross-site",
@@ -307,6 +345,11 @@ class DomainSessionPool:
     Pool capacity is bounded by ``max_entries`` (LRU eviction) to prevent
     unbounded memory growth under many active (profile × domain × session)
     combinations.
+
+    Each session is constructed with ``extra_fp={"tls_permute_extensions": True}``
+    so that the ClientHello extension sequence varies per TLS handshake, matching
+    Chrome's per-connection randomisation behaviour. See module docstring for
+    the full rationale.
     """
 
     def __init__(self, max_entries: int = MAX_DOMAIN_SESSIONS) -> None:
@@ -349,7 +392,15 @@ class DomainSessionPool:
                     log.warning("Error closing evicted session: %s", exc)
 
             log.debug("Session pool miss — creating: profile=%s domain=%s exit=%s", *key)
-            session = AsyncSession(impersonate=profile)
+            # extra_fp tls_permute_extensions: shuffle the ClientHello extension
+            # list on every new TLS handshake. Modern Chrome randomises extension
+            # order per connection; a static sequence across requests from the
+            # same session is itself a fingerprint visible in raw ClientHello
+            # inspection and in JA3. This matches Chrome's actual behaviour.
+            session = AsyncSession(
+                impersonate=profile,
+                extra_fp={"tls_permute_extensions": True},
+            )
             self._pool[key] = session
             return session
 
@@ -384,18 +435,40 @@ def build_contextual_headers(locale: str, hint: ReferrerHint) -> dict[str, str]:
     lower-priority signal that curl_cffi ignores at the TLS level while the
     Java side believes it was applied.
 
-    The only values that are legitimately context-dependent (and therefore
-    cannot be baked into a static profile) are:
+    The values assembled here are those that are legitimately context-dependent
+    (varying per exit country or per navigation attempt) plus the constant
+    Sec-Fetch-* members that must always accompany Sec-Fetch-Site to form a
+    valid top-level navigation context:
 
     - ``Accept-Language``: changes per exit country; must match the apparent
       IP geolocation to avoid the language/IP inconsistency signal.
-    - ``Referer`` + ``Sec-Fetch-Site``: the Referer URL and its coupled
-      Sec-Fetch-Site value form a navigation context that varies per attempt.
-      Both are derived from the same ReferrerHint so they cannot disagree.
+
+    - ``Referer`` + ``Sec-Fetch-Site``: vary per attempt via ReferrerHint.
+      Both are derived from the same hint so they cannot disagree.
+
+    - ``Sec-Fetch-Mode: navigate``, ``Sec-Fetch-User: ?1``,
+      ``Sec-Fetch-Dest: document``: constant for every top-level page fetch.
+      Real Chrome always emits all four Sec-Fetch-* headers as a unit on a
+      top-level navigation; emitting only Sec-Fetch-Site while omitting the
+      other three produces a partial context that Chrome never generates and
+      that vendors inspecting HTTP/2 header presence as a group will flag.
+
+      Sec-Fetch-User: ?1 is technically correct only for user-initiated
+      navigations; a programmatic get() is not user-initiated. However,
+      omitting ?1 while sending the rest of the quartet is a partial pattern
+      that real browsers never produce. The full quartet is always correct.
+
+      These three are constant and therefore do not belong in the Java DTO
+      or in any per-request decision logic — they live here as stable
+      infrastructure alongside the context-dependent fields.
     """
     headers: dict[str, str] = {
         "Accept-Language": locale,
-        "Sec-Fetch-Site":  _SEC_FETCH_SITE[hint],
+        # ── Sec-Fetch quartet ──────────────────────────────────────────────
+        "Sec-Fetch-Site":  _SEC_FETCH_SITE[hint],   # context-dependent
+        "Sec-Fetch-Mode":  "navigate",               # constant: top-level nav
+        "Sec-Fetch-User":  "?1",                     # constant: treat as user-initiated
+        "Sec-Fetch-Dest":  "document",               # constant: full-page document
     }
 
     referrer_url = _REFERRER_URL[hint]
