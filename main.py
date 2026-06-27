@@ -1,6 +1,8 @@
 """
 curl_cffi sidecar — FastAPI service providing TLS-impersonating HTTP fetches.
 
+VERSION: 1.1.0  (profile probe + Firefox cleanup)
+
 The sidecar's sole responsibility is low-level network execution:
   - Maintaining per-(profile, domain, proxy-exit-identity) sessions that carry
     browser-matching TLS fingerprints, cookie jars, and connection pools.
@@ -11,7 +13,7 @@ The sidecar's sole responsibility is low-level network execution:
 All orchestration (retry logic, challenge detection, proxy session rotation,
 strategy selection) lives in the Java news-scraper service.
 
-KEY FIX (session isolation):
+KEY FIX (session isolation, v1.0.0):
   Previously DomainSessionPool used (profile, domain) as the key. Cookies
   minted on residential exit-IP-A were silently replayed on exit-IP-B when the
   Java layer rotated the proxy session, creating a cross-IP cookie replay that
@@ -19,6 +21,26 @@ KEY FIX (session isolation):
   3-tuple (profile, domain, exit_id) where exit_id is derived from the
   DataImpulse sticky-session username, binding each session to the specific
   residential exit that created it.
+
+KEY FIX (profile probe, v1.1.0):
+  Previously SUPPORTED_IMPERSONATE_PROFILES was a hand-maintained frozenset
+  that included profiles the installed curl_cffi version did not actually
+  support (e.g. "firefox144"). The SidecarProfileValidator on the Java side
+  checked Java-enum ⊆ sidecar-set, but the sidecar-set was wrong — validation
+  appeared green while every Firefox-profile fetch failed silently via the
+  FALLBACK_IMPERSONATE_PROFILE path.
+
+  The supported set is now derived at startup by probing each candidate via
+  curl_cffi.get_fingerprint(). Profiles the installed library rejects are
+  dropped from SUPPORTED_IMPERSONATE_PROFILES with an ERROR log and are
+  excluded from the /api/v1/profiles response. The Java SidecarProfileValidator
+  then correctly flags any Java BrowserProfile entry whose curl_cffi name is
+  absent from the sidecar's supported set, surfacing the drift at startup
+  rather than silently degrading fetch quality at runtime.
+
+  firefox144 has been removed from PROFILE_CANDIDATES: it was never present in
+  any curl_cffi release. firefox147 is retained and probed — it was added with
+  HTTP/3 fingerprints in curl_cffi 0.15.0; the probe confirms its availability.
 """
 from __future__ import annotations
 
@@ -32,26 +54,127 @@ from urllib.parse import urlparse
 
 import uvicorn
 from curl_cffi.requests import AsyncSession
-from curl_cffi.requests.exceptions import RequestsError, Timeout
+from curl_cffi.requests.exceptions import RequestException, Timeout
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 # ── Logging ───────────────────────────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
 log = logging.getLogger(__name__)
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── Profile probe ─────────────────────────────────────────────────────────────
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    yield
-    await _domain_session_pool.close_all()
+# Candidate profiles we ASK the probe about. Every entry here must have a
+# corresponding BrowserProfile enum member in the Java CurlCffiFetcher.
+#
+# Rules for maintaining this list:
+#   ADD    — only after confirming the target name appears in curl_cffi's
+#            supported-targets documentation for the pinned version.
+#   REMOVE — when the Java BrowserProfile enum drops the entry, or when the
+#            probe has been erroring on it for multiple releases.
+#
+# "firefox144" was removed: it was never present in any curl_cffi release.
+# "firefox147" is probed: it was added with HTTP/3 fingerprints in v0.15.0;
+#              the probe determines whether it is also valid for HTTP/1.1 and
+#              HTTP/2 fetches on the installed version.
+_PROFILE_CANDIDATES: frozenset[str] = frozenset({
+    "chrome146",
+    "chrome145",
+    "firefox147",
+    "safari2601",
+    "safari260",
+})
 
 
-app = FastAPI(title="curl-cffi-sidecar", version="1.0.0", lifespan=lifespan)
+def _curl_cffi_version() -> str:
+    """Returns the installed curl_cffi version string for log context."""
+    try:
+        import curl_cffi as _cc
+        return getattr(_cc, "__version__", "unknown")
+    except Exception:
+        return "unknown"
+
+
+def _build_supported_profiles() -> frozenset[str]:
+    """
+    Derives SUPPORTED_IMPERSONATE_PROFILES by probing each candidate against
+    the installed curl_cffi version at startup.
+
+    Uses ``curl_cffi.get_fingerprint()`` (available since v0.6.0) to validate
+    a profile name synchronously without network access. Profiles the library
+    rejects are excluded with an ERROR log so the Java SidecarProfileValidator
+    immediately surfaces the drift.
+
+    Falls back to returning all candidates unchanged when ``get_fingerprint``
+    is unavailable (pre-v0.6.0 install), with a WARNING. In that case the Java
+    validator is the last line of defence.
+
+    Raises a startup-blocking RuntimeError when the probe rejects every
+    candidate, because no meaningful fetch can be served with an empty
+    supported set.
+    """
+    version = _curl_cffi_version()
+
+    try:
+        from curl_cffi import get_fingerprint  # available since curl_cffi 0.6.0
+    except ImportError:
+        log.warning(
+            "curl_cffi.get_fingerprint unavailable (version: %s, expected >= 0.6.0). "
+            "Skipping startup profile probe — all %d candidates assumed valid. "
+            "Upgrade curl_cffi to enable the probe.",
+            version,
+            len(_PROFILE_CANDIDATES),
+        )
+        return _PROFILE_CANDIDATES
+
+    accepted: set[str] = set()
+
+    for name in sorted(_PROFILE_CANDIDATES):  # sorted for deterministic log output
+        try:
+            get_fingerprint(name)
+            accepted.add(name)
+            log.debug("Profile probe accepted: %r (curl_cffi %s)", name, version)
+        except Exception as exc:
+            log.error(
+                "Profile probe REJECTED %r (curl_cffi %s): %s. "
+                "Profile dropped from SUPPORTED_IMPERSONATE_PROFILES. "
+                "Either remove the matching BrowserProfile entry from the Java "
+                "CurlCffiFetcher enum, or upgrade to a curl_cffi version that "
+                "includes this profile.",
+                name, version, exc,
+            )
+
+    if not accepted:
+        raise RuntimeError(
+            f"curl_cffi {version} probe rejected ALL {len(_PROFILE_CANDIDATES)} "
+            f"candidates {sorted(_PROFILE_CANDIDATES)}. "
+            "No impersonate profiles are available — every fetch will fail. "
+            "Check PROFILE_CANDIDATES and the pinned curl_cffi version."
+        )
+
+    log.info(
+        "Profile probe complete (curl_cffi %s): %d/%d accepted — %s",
+        version,
+        len(accepted),
+        len(_PROFILE_CANDIDATES),
+        sorted(accepted),
+    )
+    return frozenset(accepted)
+
+
+# Derived at module import time. The probe runs once and the result is
+# immutable for the lifetime of the process.
+SUPPORTED_IMPERSONATE_PROFILES: frozenset[str] = _build_supported_profiles()
+
+# Fallback profile for _resolve_profile() when the requested profile is absent
+# from SUPPORTED_IMPERSONATE_PROFILES. "chrome146" is always expected to be in
+# _PROFILE_CANDIDATES and to pass the probe. _resolve_profile() handles the
+# edge case where even this fallback is absent after the probe.
+FALLBACK_IMPERSONATE_PROFILE = "chrome146"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -61,22 +184,27 @@ MAX_DOMAIN_SESSIONS = 80
 
 DEFAULT_TIMEOUT_SECONDS = 20
 
-# All impersonate profiles accepted by this sidecar.
-# Must remain a *superset* of every BrowserProfile.curlCffiName declared in
-# the Java CurlCffiFetcher enum. The Java SidecarProfileValidator checks this
-# at startup; any profile added to the Java enum must be added here first.
-SUPPORTED_IMPERSONATE_PROFILES: frozenset[str] = frozenset({
-    "chrome146",
-    "chrome145",
-    "firefox147",
-    "firefox144",
-    "safari2601",
-    "safari260",
-})
+# ── App / lifespan ────────────────────────────────────────────────────────────
 
-FALLBACK_IMPERSONATE_PROFILE = "chrome146"
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # _build_supported_profiles() already ran at import time and would have
+    # raised if no profiles were accepted. Log the final supported set here for
+    # visibility in the service journal at startup.
+    log.info(
+        "curl_cffi sidecar ready — %d supported profile(s): %s",
+        len(SUPPORTED_IMPERSONATE_PROFILES),
+        sorted(SUPPORTED_IMPERSONATE_PROFILES),
+    )
+    yield
+    await _domain_session_pool.close_all()
+
+
+app = FastAPI(title="curl-cffi-sidecar", version="1.1.0", lifespan=lifespan)
 
 # ── DTOs ──────────────────────────────────────────────────────────────────────
+
 
 class CurlCffiFetchRequest(BaseModel):
     """
@@ -86,15 +214,15 @@ class CurlCffiFetchRequest(BaseModel):
     the Java layer owns retry state, backoff, session rotation, and
     challenge detection; these do not appear here.
     """
-    url:            str
-    proxy_url:      str | None = Field(default=None)
-    impersonate:    str        = Field(default=FALLBACK_IMPERSONATE_PROFILE)
-    timeout:        int        = Field(default=DEFAULT_TIMEOUT_SECONDS, ge=1, le=120)
+    url:           str
+    proxy_url:     str | None = Field(default=None)
+    impersonate:   str        = Field(default=FALLBACK_IMPERSONATE_PROFILE)
+    timeout:       int        = Field(default=DEFAULT_TIMEOUT_SECONDS, ge=1, le=120)
     # Accept-Language value derived from the proxy exit country on the Java side.
-    locale:         str        = Field(default="en-US,en;q=0.9")
+    locale:        str        = Field(default="en-US,en;q=0.9")
     # Semantic referrer hint — resolved to concrete headers in build_contextual_headers.
     # Values must match ReferrerHint.sidecarValue() in the Java enum exactly.
-    referrer_hint:  str        = Field(default="direct")
+    referrer_hint: str        = Field(default="direct")
 
 
 class CurlCffiFetchResponse(BaseModel):
@@ -104,6 +232,7 @@ class CurlCffiFetchResponse(BaseModel):
 
 
 # ── ReferrerHint ──────────────────────────────────────────────────────────────
+
 
 class ReferrerHint(str, Enum):
     """
@@ -244,10 +373,10 @@ _domain_session_pool = DomainSessionPool()
 
 def build_contextual_headers(locale: str, hint: ReferrerHint) -> dict[str, str]:
     """
-    Assembles the two context-dependent header overrides on top of the
-    curl_cffi impersonate profile's baseline.
+    Assembles the context-dependent header overrides on top of the curl_cffi
+    impersonate profile's baseline.
 
-    WHY ONLY TWO FIELDS:
+    WHY ONLY THESE FIELDS:
     The impersonate profile already provides a complete, browser-matched header
     set — User-Agent, sec-ch-ua, Accept, Accept-Encoding, and the underlying
     TLS fingerprint (cipher suites, extensions, ALPN, JA4) — as a single
@@ -255,7 +384,7 @@ def build_contextual_headers(locale: str, hint: ReferrerHint) -> dict[str, str]:
     lower-priority signal that curl_cffi ignores at the TLS level while the
     Java side believes it was applied.
 
-    The only two values that are legitimately context-dependent (and therefore
+    The only values that are legitimately context-dependent (and therefore
     cannot be baked into a static profile) are:
 
     - ``Accept-Language``: changes per exit country; must match the apparent
@@ -286,14 +415,47 @@ def _resolve_hint(raw: str) -> ReferrerHint:
 
 
 def _resolve_profile(requested: str) -> str:
-    """Validates the requested impersonate profile, falling back to the default."""
+    """
+    Validates the requested impersonate profile against the probe-derived
+    SUPPORTED_IMPERSONATE_PROFILES, falling back gracefully.
+
+    Priority order:
+      1. Requested profile is supported → return it.
+      2. Requested profile is absent, FALLBACK_IMPERSONATE_PROFILE is present
+         → warn and return fallback.
+      3. Both absent (only possible if probe dropped the fallback) → pick any
+         available profile rather than raising, and log at ERROR.
+      4. SUPPORTED_IMPERSONATE_PROFILES is empty → raise RuntimeError.
+         (_build_supported_profiles already raises at import time for this
+         case, so this branch is a belt-and-suspenders guard.)
+    """
     if requested in SUPPORTED_IMPERSONATE_PROFILES:
         return requested
+
     log.warning(
-        "Unsupported impersonate profile %r — falling back to %s.",
-        requested, FALLBACK_IMPERSONATE_PROFILE,
+        "Requested impersonate profile %r is not in SUPPORTED_IMPERSONATE_PROFILES %s "
+        "— this should have been flagged by SidecarProfileValidator at Java startup.",
+        requested,
+        sorted(SUPPORTED_IMPERSONATE_PROFILES),
     )
-    return FALLBACK_IMPERSONATE_PROFILE
+
+    if FALLBACK_IMPERSONATE_PROFILE in SUPPORTED_IMPERSONATE_PROFILES:
+        log.warning("Falling back to %r.", FALLBACK_IMPERSONATE_PROFILE)
+        return FALLBACK_IMPERSONATE_PROFILE
+
+    # Fallback itself was also dropped by the probe — pick any available profile.
+    available = next(iter(SUPPORTED_IMPERSONATE_PROFILES), None)
+    if available is None:
+        raise RuntimeError(
+            "SUPPORTED_IMPERSONATE_PROFILES is empty. "
+            "No impersonate profiles available — cannot serve this request."
+        )
+    log.error(
+        "Fallback profile %r also absent after probe. "
+        "Using emergency fallback %r.",
+        FALLBACK_IMPERSONATE_PROFILE, available,
+    )
+    return available
 
 
 # ── Endpoint ──────────────────────────────────────────────────────────────────
@@ -319,7 +481,7 @@ async def execute_fetch(request_dto: CurlCffiFetchRequest) -> CurlCffiFetchRespo
     session = await _domain_session_pool.get_or_create(
         active_profile,
         domain,
-        request_dto.proxy_url,  # session key now includes exit identity
+        request_dto.proxy_url,
     )
 
     context_headers = build_contextual_headers(request_dto.locale, hint)
@@ -359,7 +521,7 @@ async def execute_fetch(request_dto: CurlCffiFetchRequest) -> CurlCffiFetchRespo
         )
         return CurlCffiFetchResponse(html=None, final_url=None, status_code=502)
 
-    except RequestsError as exc:
+    except RequestException as exc:
         # Known curl_cffi transport error (connection reset, proxy error, etc.).
         # Still recoverable via Java retry — log at ERROR without traceback.
         log.error(
@@ -374,14 +536,9 @@ async def execute_fetch(request_dto: CurlCffiFetchRequest) -> CurlCffiFetchRespo
             "fetch UNEXPECTED  profile=%-10s url=%s  error=%s",
             active_profile, request_dto.url, exc,
         )
-        # Return 502 so the Java layer's TargetFetchException path fires and the
-        # retry engine handles the failure — do not raise an HTTP exception here
-        # because that would bypass the Java retry / circuit-breaker logic.
-        return CurlCffiFetchResponse(
-            html=None,
-            final_url=None,
-            status_code=502,
-        )
+        # Return 502 so the Java retry / circuit-breaker path fires — do not
+        # raise an HTTP exception here as that bypasses the Java retry engine.
+        return CurlCffiFetchResponse(html=None, final_url=None, status_code=502)
 
 
 # ── Profiles endpoint ─────────────────────────────────────────────────────────
@@ -389,9 +546,13 @@ async def execute_fetch(request_dto: CurlCffiFetchRequest) -> CurlCffiFetchRespo
 @app.get("/api/v1/profiles")
 async def get_profiles() -> dict[str, list[str]]:
     """
-    Returns the set of impersonate profiles this sidecar accepts.
-    Called at startup by SidecarProfileValidator to verify the Java
-    BrowserProfile enum and the sidecar's supported set are in sync.
+    Returns the probe-derived set of impersonate profiles this sidecar accepts.
+
+    Called at Java startup by SidecarProfileValidator to verify that the Java
+    BrowserProfile enum's curlCffiName values are a subset of the profiles the
+    installed curl_cffi version actually supports. Because SUPPORTED_IMPERSONATE_PROFILES
+    is derived at startup by probing get_fingerprint(), this endpoint now reflects
+    ground truth rather than a hand-maintained constant that can drift.
     """
     return {"profiles": sorted(SUPPORTED_IMPERSONATE_PROFILES)}
 
