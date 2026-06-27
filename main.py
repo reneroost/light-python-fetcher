@@ -1,7 +1,7 @@
 """
 curl_cffi sidecar — FastAPI service providing TLS-impersonating HTTP fetches.
 
-VERSION: 1.2.0  (Sec-Fetch quartet + TLS extension order randomisation)
+VERSION: 1.3.0  (TLS/JA4 self-verification fingerprint probe)
 
 The sidecar's sole responsibility is low-level network execution:
   - Maintaining per-(profile, domain, proxy-exit-identity) sessions that carry
@@ -67,6 +67,32 @@ KEY FIX (Sec-Fetch quartet, v1.2.0):
   sending the other three is a partial set that real Chrome never produces.
   The full quartet is the only pattern a browser actually emits.
 
+NEW (fingerprint probe, v1.3.0):
+  A TLS/JA4 self-verification probe runs at startup and periodically
+  thereafter (default every 24 hours). For every supported profile it
+  fires one request to https://tls.peet.ws/api/all through the egress
+  proxy and logs the observed JA4, JA3 hash, and HTTP version at INFO.
+  If the request fails it logs at ERROR.
+
+  The probe is OBSERVATIONAL, not assertional. Expected JA4 values are
+  not hardcoded because they change with every curl_cffi release. The
+  intent is to surface "our fingerprint changed" in the journal so a
+  human can correlate a block-rate spike against a library upgrade rather
+  than hunting blind. The probe never prevents the sidecar from starting
+  or serving requests.
+
+  Configuration (environment variables):
+    SIDECAR_PROBE_PROXY_URL       — full DataImpulse proxy URL used for
+                                    probe requests (no session suffix;
+                                    anonymous sticky session per probe).
+                                    Omit to probe without proxy (direct).
+    SIDECAR_PROBE_INTERVAL_HOURS  — hours between periodic probe runs
+                                    (default 24; set to 0 to disable
+                                    periodic runs after startup).
+
+  Manual trigger: GET /api/v1/fingerprint-probe returns the most recent
+  probe result set without waiting for the next scheduled run.
+
 KEY FIX (TLS extension order randomisation, v1.2.0):
   AsyncSession is now constructed with extra_fp={"tls_permute_extensions": True}.
   Modern Chrome randomises ClientHello extension order per connection; a
@@ -81,10 +107,13 @@ KEY FIX (TLS extension order randomisation, v1.2.0):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from urllib.parse import urlparse
 
@@ -233,11 +262,49 @@ async def lifespan(_: FastAPI):
         len(SUPPORTED_IMPERSONATE_PROFILES),
         sorted(SUPPORTED_IMPERSONATE_PROFILES),
     )
+
+    # Launch the startup fingerprint probe as a background task so it does not
+    # block the server from accepting its first real request. The probe output
+    # lands in the journal within a few seconds of startup.
+    probe_task = asyncio.create_task(_run_fingerprint_probe())
+    # Schedule the periodic probe loop regardless of whether the startup probe
+    # has finished — the loop waits SIDECAR_PROBE_INTERVAL_HOURS before its
+    # first iteration, so there is no double-fire on startup.
+    loop_task = asyncio.create_task(_fingerprint_probe_loop())
+
     yield
+
+    # Cancel background tasks gracefully on shutdown.
+    for task in (probe_task, loop_task):
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     await _domain_session_pool.close_all()
 
 
-app = FastAPI(title="curl-cffi-sidecar", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="curl-cffi-sidecar", version="1.3.0", lifespan=lifespan)
+
+# ── Fingerprint probe configuration ───────────────────────────────────────────
+
+# Full DataImpulse proxy URL for probe requests (no session suffix; the probe
+# uses a fresh one-off anonymous session per profile). Unset → direct (no proxy).
+_PROBE_PROXY_URL: str | None = os.environ.get("SIDECAR_PROBE_PROXY_URL") or None
+
+# Hours between periodic probe runs. 0 → disabled after startup.
+_PROBE_INTERVAL_HOURS: float = float(
+    os.environ.get("SIDECAR_PROBE_INTERVAL_HOURS", "24")
+)
+
+# Public endpoint used by the probe. Returns JSON with nested "tls" and
+# "http_version" keys — see _run_fingerprint_probe for field extraction.
+_PROBE_TARGET_URL: str = "https://tls.peet.ws/api/all"
+
+# Per-request timeout for probe fetches. Kept short because tls.peet.ws is
+# a lightweight JSON API; a long hang here would delay the startup log line.
+_PROBE_TIMEOUT_SECONDS: int = 15
 
 # ── DTOs ──────────────────────────────────────────────────────────────────────
 
@@ -420,7 +487,172 @@ class DomainSessionPool:
 _domain_session_pool = DomainSessionPool()
 
 
-# ── Header assembly ───────────────────────────────────────────────────────────
+# ── TLS/JA4 fingerprint probe ─────────────────────────────────────────────────
+
+@dataclass
+class ProfileProbeResult:
+    """
+    Observed fingerprint for one impersonation profile during a probe run.
+
+    All fields are populated on success. On failure only ``profile`` and
+    ``error`` are set; the fingerprint fields are empty strings.
+    """
+    profile:      str
+    ja4:          str = ""
+    ja3_hash:     str = ""
+    http_version: str = ""
+    error:        str = ""
+    timestamp:    str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+
+# Most recent probe results, indexed by profile name. Initialised empty;
+# populated on first probe run. Exposed via GET /api/v1/fingerprint-probe.
+_last_probe_results: dict[str, ProfileProbeResult] = {}
+
+
+async def _probe_one_profile(
+    profile:   str,
+    proxy_url: str | None,
+) -> ProfileProbeResult:
+    """
+    Fires a single request to tls.peet.ws/api/all for the given profile and
+    returns the observed fingerprint fields.
+
+    Uses a fresh one-off AsyncSession per call — not the DomainSessionPool —
+    to avoid polluting the pool with probe-only connection state and to ensure
+    each probe sees a clean TLS handshake unreused by any prior real fetch.
+
+    The proxy is a raw DataImpulse base URL (no session suffix); each probe
+    request obtains its own residential exit via DataImpulse's default
+    round-robin allocation.
+    """
+    try:
+        proxies = (
+            {"https": proxy_url, "http": proxy_url}
+            if proxy_url
+            else None
+        )
+
+        async with AsyncSession(
+            impersonate=profile,
+            extra_fp={"tls_permute_extensions": True},
+        ) as session:
+            response = await session.get(
+                _PROBE_TARGET_URL,
+                proxies=proxies,
+                timeout=_PROBE_TIMEOUT_SECONDS,
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+            data: dict = response.json()
+
+        tls_block    = data.get("tls", {})
+        ja4          = tls_block.get("ja4", "")
+        ja3_hash     = tls_block.get("ja3_hash", "")
+        http_version = data.get("http_version", "")
+
+        return ProfileProbeResult(
+            profile=profile,
+            ja4=ja4,
+            ja3_hash=ja3_hash,
+            http_version=http_version,
+        )
+
+    except Exception as exc:
+        return ProfileProbeResult(profile=profile, error=str(exc))
+
+
+async def _run_fingerprint_probe() -> None:
+    """
+    Probes every supported profile against tls.peet.ws/api/all through the
+    egress proxy and logs the observed TLS fingerprint.
+
+    This is an OBSERVATIONAL probe, not an assertion. Expected JA4 values are
+    not hardcoded because they change with each curl_cffi release. The purpose
+    is to surface fingerprint drift in the journal so a block-rate spike can
+    be correlated against a library upgrade.
+
+    On success logs INFO per profile:
+        [fingerprint-probe] chrome146 | JA4: t13d... | JA3: aa56... | HTTP/2
+
+    On request failure logs ERROR per profile:
+        [fingerprint-probe] chrome146 | ERROR: <reason>
+
+    Never raises — all exceptions are caught so a probe failure cannot
+    affect normal fetch availability.
+    """
+    profiles = sorted(SUPPORTED_IMPERSONATE_PROFILES)
+    proxy_display = (
+        urlparse(_PROBE_PROXY_URL).hostname if _PROBE_PROXY_URL else "direct"
+    )
+    log.info(
+        "[fingerprint-probe] starting run — %d profile(s), proxy: %s",
+        len(profiles),
+        proxy_display,
+    )
+
+    results = await asyncio.gather(
+        *[_probe_one_profile(p, _PROBE_PROXY_URL) for p in profiles],
+        return_exceptions=False,
+    )
+
+    for result in results:
+        _last_probe_results[result.profile] = result
+        if result.error:
+            log.error(
+                "[fingerprint-probe] %-12s | ERROR: %s",
+                result.profile,
+                result.error,
+            )
+        else:
+            log.info(
+                "[fingerprint-probe] %-12s | JA4: %s | JA3: %s | %s",
+                result.profile,
+                result.ja4      or "(absent)",
+                result.ja3_hash or "(absent)",
+                result.http_version or "(unknown)",
+            )
+
+    errors = sum(1 for r in results if r.error)
+    log.info(
+        "[fingerprint-probe] run complete — %d/%d profiles succeeded",
+        len(results) - errors,
+        len(results),
+    )
+
+
+async def _fingerprint_probe_loop() -> None:
+    """
+    Background task that runs _run_fingerprint_probe periodically.
+
+    Skips periodic runs when SIDECAR_PROBE_INTERVAL_HOURS is 0.
+    The startup run is launched separately in lifespan so this loop
+    only handles subsequent scheduled runs.
+    """
+    if _PROBE_INTERVAL_HOURS <= 0:
+        log.info("[fingerprint-probe] periodic runs disabled (interval=0).")
+        return
+
+    interval_seconds = _PROBE_INTERVAL_HOURS * 3600
+    log.info(
+        "[fingerprint-probe] periodic probe scheduled every %.1f hour(s).",
+        _PROBE_INTERVAL_HOURS,
+    )
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await _run_fingerprint_probe()
+        except Exception as exc:
+            # Should never reach here — _run_fingerprint_probe catches its own
+            # exceptions. Belt-and-suspenders so the loop never dies silently.
+            log.error(
+                "[fingerprint-probe] unhandled exception in periodic run: %s", exc
+            )
+
+
 
 def build_contextual_headers(locale: str, hint: ReferrerHint) -> dict[str, str]:
     """
@@ -628,6 +860,52 @@ async def get_profiles() -> dict[str, list[str]]:
     ground truth rather than a hand-maintained constant that can drift.
     """
     return {"profiles": sorted(SUPPORTED_IMPERSONATE_PROFILES)}
+
+
+# ── Fingerprint probe endpoint ────────────────────────────────────────────────
+
+@app.get("/api/v1/fingerprint-probe")
+async def get_fingerprint_probe(run: bool = False) -> dict:
+    """
+    Returns the most recent fingerprint probe results for all supported profiles.
+
+    Optional query parameter:
+      ?run=true  — triggers a fresh probe run synchronously and returns the
+                   new results. Useful for post-deploy verification without
+                   waiting for the next scheduled run or reading the journal.
+                   The probe runs in the foreground; expect a response time of
+                   ~(num_profiles × _PROBE_TIMEOUT_SECONDS) in the worst case.
+
+    When called without ?run=true, returns the last cached results immediately.
+    If no probe has completed yet (sidecar just started), returns an empty dict.
+
+    Example response:
+      {
+        "chrome146": {
+          "profile": "chrome146",
+          "ja4": "t13d1516h2_...",
+          "ja3_hash": "aa56c057...",
+          "http_version": "h2",
+          "error": "",
+          "timestamp": "2026-06-27T10:00:00+00:00"
+        },
+        ...
+      }
+    """
+    if run:
+        await _run_fingerprint_probe()
+
+    return {
+        profile: {
+            "profile":      result.profile,
+            "ja4":          result.ja4,
+            "ja3_hash":     result.ja3_hash,
+            "http_version": result.http_version,
+            "error":        result.error,
+            "timestamp":    result.timestamp,
+        }
+        for profile, result in _last_probe_results.items()
+    }
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
