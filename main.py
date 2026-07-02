@@ -1,7 +1,7 @@
 """
 curl_cffi sidecar — FastAPI service providing TLS-impersonating HTTP fetches.
 
-VERSION: 1.3.0  (TLS/JA4 self-verification fingerprint probe)
+VERSION: 1.4.0  (post-quantum key-share assertion in the TLS/JA4 probe)
 
 The sidecar's sole responsibility is low-level network execution:
   - Maintaining per-(profile, domain, proxy-exit-identity) sessions that carry
@@ -103,6 +103,37 @@ KEY FIX (TLS extension order randomisation, v1.2.0):
   Chrome's actual per-connection behaviour. This does not affect the JA4
   hash (JA4 sorts extensions before hashing) but eliminates the static
   ordering signal visible in raw ClientHello inspection and in JA3.
+
+NEW (post-quantum key-share assertion, v1.4.0):
+  As of early 2026, Chrome, Firefox, and Safari send a hybrid post-quantum
+  key share (X25519MLKEM768, TLS supported_group 0x11EC / decimal 4588) by
+  default in every TLS 1.3 ClientHello. Akamai made PQ key exchange the
+  default for all origin connections on 2026-01-31; Cloudflare, Akamai, and
+  DataDome cross-reference key-share presence against the claimed browser
+  identity. A ClientHello claiming a current Chrome/Safari version while
+  omitting the PQ group has no matching "known-good" fingerprint in these
+  vendors' baselines and is scored before a single byte of HTTP traffic is
+  exchanged — this fires earlier than any header- or behaviour-based check.
+
+  Unlike JA4/JA3 drift, this is not merely observational: a missing PQ group
+  on a profile that is expected to carry one is an active, actionable signal
+  that the pinned curl-impersonate build is stale relative to the browser
+  version it claims to be. The existing fingerprint probe is extended to
+  assert PQ group presence per profile and log ERROR when absent, without
+  changing the probe's non-blocking nature — a failed assertion never
+  prevents the sidecar from starting or serving requests, same as every
+  other probe failure mode.
+
+  Detection method: tls.peet.ws/api/all returns the negotiated JA3 string at
+  tls.ja3. JA3 format is version,ciphers,extensions,supported_groups,
+  ec_point_formats (comma-separated); supported_groups is the 4th field,
+  hyphen-separated decimal values. Presence of "4588" in that field means the
+  ClientHello offered the X25519MLKEM768 hybrid group. Parsing the raw JA3
+  string (rather than assuming a specific nested-JSON shape for the TLS
+  extension list) is deliberate: the JA3-string field name and format are
+  documented and stable across peet.ws API versions, whereas the shape of any
+  more granular "extensions" object is not something this service should
+  depend on without direct confirmation.
 """
 from __future__ import annotations
 
@@ -285,7 +316,7 @@ async def lifespan(_: FastAPI):
     await _domain_session_pool.close_all()
 
 
-app = FastAPI(title="curl-cffi-sidecar", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="curl-cffi-sidecar", version="1.4.0", lifespan=lifespan)
 
 # ── Fingerprint probe configuration ───────────────────────────────────────────
 
@@ -305,6 +336,13 @@ _PROBE_TARGET_URL: str = "https://tls.peet.ws/api/all"
 # Per-request timeout for probe fetches. Kept short because tls.peet.ws is
 # a lightweight JSON API; a long hang here would delay the startup log line.
 _PROBE_TIMEOUT_SECONDS: int = 15
+
+# TLS supported_group codepoint for the X25519MLKEM768 hybrid post-quantum key
+# exchange (0x11EC), expressed as JA3 renders it: decimal, in the 4th
+# comma-separated JA3 field (supported_groups / elliptic_curves). Chrome,
+# Firefox, and Safari all send this by default as of early 2026 — see the
+# v1.4.0 module docstring section for the detection rationale.
+_PQ_KEY_SHARE_GROUP_ID: str = "4588"
 
 # ── DTOs ──────────────────────────────────────────────────────────────────────
 
@@ -495,14 +533,16 @@ class ProfileProbeResult:
     Observed fingerprint for one impersonation profile during a probe run.
 
     All fields are populated on success. On failure only ``profile`` and
-    ``error`` are set; the fingerprint fields are empty strings.
+    ``error`` are set; the fingerprint fields are empty strings and
+    ``pq_key_share_offered`` is ``False``.
     """
-    profile:      str
-    ja4:          str = ""
-    ja3_hash:     str = ""
-    http_version: str = ""
-    error:        str = ""
-    timestamp:    str = field(
+    profile:              str
+    ja4:                  str  = ""
+    ja3_hash:              str  = ""
+    http_version:          str  = ""
+    pq_key_share_offered:  bool = False
+    error:                str  = ""
+    timestamp:            str  = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
 
@@ -512,13 +552,37 @@ class ProfileProbeResult:
 _last_probe_results: dict[str, ProfileProbeResult] = {}
 
 
+def _ja3_offers_pq_group(ja3: str) -> bool:
+    """
+    Determines whether a JA3 string's supported_groups field includes the
+    X25519MLKEM768 hybrid post-quantum group (decimal 4588 / hex 0x11EC).
+
+    JA3 format: ``version,ciphers,extensions,supported_groups,ec_point_formats``
+    (comma-separated top level; hyphen-separated within each field).
+    ``supported_groups`` is the 4th field. Presence of "4588" there means the
+    ClientHello offered the PQ hybrid key-share group.
+
+    Returns False (rather than raising) on any malformed or empty input, so a
+    parsing surprise degrades to "PQ not confirmed" — logged as an assertion
+    failure — instead of crashing the probe.
+    """
+    if not ja3:
+        return False
+    fields = ja3.split(",")
+    if len(fields) < 4:
+        return False
+    supported_groups = fields[3].split("-")
+    return _PQ_KEY_SHARE_GROUP_ID in supported_groups
+
+
 async def _probe_one_profile(
     profile:   str,
     proxy_url: str | None,
 ) -> ProfileProbeResult:
     """
     Fires a single request to tls.peet.ws/api/all for the given profile and
-    returns the observed fingerprint fields.
+    returns the observed fingerprint fields, including whether the ClientHello
+    offered the post-quantum hybrid key-share group.
 
     Uses a fresh one-off AsyncSession per call — not the DomainSessionPool —
     to avoid polluting the pool with probe-only connection state and to ensure
@@ -550,14 +614,17 @@ async def _probe_one_profile(
 
         tls_block    = data.get("tls", {})
         ja4          = tls_block.get("ja4", "")
+        ja3_raw      = tls_block.get("ja3", "")
         ja3_hash     = tls_block.get("ja3_hash", "")
         http_version = data.get("http_version", "")
+        pq_offered   = _ja3_offers_pq_group(ja3_raw)
 
         return ProfileProbeResult(
             profile=profile,
             ja4=ja4,
             ja3_hash=ja3_hash,
             http_version=http_version,
+            pq_key_share_offered=pq_offered,
         )
 
     except Exception as exc:
@@ -567,15 +634,29 @@ async def _probe_one_profile(
 async def _run_fingerprint_probe() -> None:
     """
     Probes every supported profile against tls.peet.ws/api/all through the
-    egress proxy and logs the observed TLS fingerprint.
+    egress proxy and logs the observed TLS fingerprint, including a
+    post-quantum key-share assertion.
 
-    This is an OBSERVATIONAL probe, not an assertion. Expected JA4 values are
-    not hardcoded because they change with each curl_cffi release. The purpose
-    is to surface fingerprint drift in the journal so a block-rate spike can
-    be correlated against a library upgrade.
+    The JA4/JA3 portion remains OBSERVATIONAL, not assertional — expected
+    values are not hardcoded because they change with each curl_cffi release.
 
-    On success logs INFO per profile:
-        [fingerprint-probe] chrome146 | JA4: t13d... | JA3: aa56... | HTTP/2
+    The post-quantum key-share check IS assertional: every profile in
+    SUPPORTED_IMPERSONATE_PROFILES claims a browser version that, as of early
+    2026, sends the X25519MLKEM768 hybrid group by default. A profile missing
+    it is logged at ERROR as an actionable drift signal — the pinned
+    curl-impersonate build is stale relative to the browser version it claims
+    to impersonate. This still never blocks startup or serving; see the
+    v1.4.0 module docstring section.
+
+  On success logs INFO per profile:
+      [fingerprint-probe] chrome146 | JA4: t13d... | JA3: aa56... | HTTP/2 | PQ: yes
+
+  On missing PQ key share logs ERROR per profile (in addition to the INFO line):
+      [fingerprint-probe] chrome146 | PQ KEY SHARE MISSING — ClientHello did not
+      offer X25519MLKEM768 (group 4588). Fingerprint may be stale relative to
+      the claimed browser version; expect vendor-side scoring as an
+      unrecognised/inconsistent fingerprint on PQ-enforcing targets (Akamai,
+      Cloudflare Bot Management).
 
     On request failure logs ERROR per profile:
         [fingerprint-probe] chrome146 | ERROR: <reason>
@@ -606,20 +687,38 @@ async def _run_fingerprint_probe() -> None:
                 result.profile,
                 result.error,
             )
-        else:
-            log.info(
-                "[fingerprint-probe] %-12s | JA4: %s | JA3: %s | %s",
+            continue
+
+        log.info(
+            "[fingerprint-probe] %-12s | JA4: %s | JA3: %s | %s | PQ: %s",
+            result.profile,
+            result.ja4      or "(absent)",
+            result.ja3_hash or "(absent)",
+            result.http_version or "(unknown)",
+            "yes" if result.pq_key_share_offered else "no",
+        )
+
+        if not result.pq_key_share_offered:
+            log.error(
+                "[fingerprint-probe] %-12s | PQ KEY SHARE MISSING — ClientHello did not "
+                "offer X25519MLKEM768 (group %s). Fingerprint may be stale relative to "
+                "the claimed browser version; expect vendor-side scoring as an "
+                "unrecognised/inconsistent fingerprint on PQ-enforcing targets "
+                "(Akamai, Cloudflare Bot Management). Check for a newer curl-impersonate "
+                "build that includes this profile's post-quantum ClientHello.",
                 result.profile,
-                result.ja4      or "(absent)",
-                result.ja3_hash or "(absent)",
-                result.http_version or "(unknown)",
+                _PQ_KEY_SHARE_GROUP_ID,
             )
 
-    errors = sum(1 for r in results if r.error)
+    errors     = sum(1 for r in results if r.error)
+    missing_pq = sum(1 for r in results if not r.error and not r.pq_key_share_offered)
     log.info(
-        "[fingerprint-probe] run complete — %d/%d profiles succeeded",
+        "[fingerprint-probe] run complete — %d/%d profiles succeeded, "
+        "%d/%d succeeded profile(s) missing PQ key share",
         len(results) - errors,
         len(results),
+        missing_pq,
+        len(results) - errors,
     )
 
 
@@ -867,7 +966,8 @@ async def get_profiles() -> dict[str, list[str]]:
 @app.get("/api/v1/fingerprint-probe")
 async def get_fingerprint_probe(run: bool = False) -> dict:
     """
-    Returns the most recent fingerprint probe results for all supported profiles.
+    Returns the most recent fingerprint probe results for all supported profiles,
+    including the post-quantum key-share assertion.
 
     Optional query parameter:
       ?run=true  — triggers a fresh probe run synchronously and returns the
@@ -886,6 +986,7 @@ async def get_fingerprint_probe(run: bool = False) -> dict:
           "ja4": "t13d1516h2_...",
           "ja3_hash": "aa56c057...",
           "http_version": "h2",
+          "pq_key_share_offered": true,
           "error": "",
           "timestamp": "2026-06-27T10:00:00+00:00"
         },
@@ -897,12 +998,13 @@ async def get_fingerprint_probe(run: bool = False) -> dict:
 
     return {
         profile: {
-            "profile":      result.profile,
-            "ja4":          result.ja4,
-            "ja3_hash":     result.ja3_hash,
-            "http_version": result.http_version,
-            "error":        result.error,
-            "timestamp":    result.timestamp,
+            "profile":              result.profile,
+            "ja4":                  result.ja4,
+            "ja3_hash":             result.ja3_hash,
+            "http_version":         result.http_version,
+            "pq_key_share_offered": result.pq_key_share_offered,
+            "error":                result.error,
+            "timestamp":            result.timestamp,
         }
         for profile, result in _last_probe_results.items()
     }
