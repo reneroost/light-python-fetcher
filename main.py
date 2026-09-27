@@ -1,11 +1,11 @@
 """
 curl_cffi sidecar — FastAPI service providing TLS-impersonating HTTP fetches.
 
-VERSION: 1.4.0  (post-quantum key-share assertion in the TLS/JA4 probe)
+VERSION: 1.5.0  (one session per fetch — the session pool is gone)
 
 The sidecar's sole responsibility is low-level network execution:
-  - Maintaining per-(profile, domain, proxy-exit-identity) sessions that carry
-    browser-matching TLS fingerprints, cookie jars, and connection pools.
+  - Running each fetch in its own curl_cffi session with a browser-matching
+    TLS fingerprint, closed as soon as the response is read.
   - Assembling the small set of context-dependent header overrides
     (Accept-Language, Referer, Sec-Fetch-*) on top of the profile baseline.
   - Returning raw HTML and upstream HTTP status to the Java layer.
@@ -21,6 +21,20 @@ KEY FIX (session isolation, v1.0.0):
   3-tuple (profile, domain, exit_id) where exit_id is derived from the
   DataImpulse sticky-session username, binding each session to the specific
   residential exit that created it.
+
+KEY FIX (memory, v1.5.0):
+  DomainSessionPool kept up to 80 sessions per worker, keyed by
+  (profile, domain, proxy exit). The Java caller gives every fetch a fresh
+  DataImpulse session and rotates the profile between retries, so the key
+  never repeated: the pool had no hits, and only kept finished sessions — each
+  ~1.2 MB of live connections, TLS state and cookies against real sites — until
+  eviction. Two busy workers plus that dead state reached the unit's 512 MB
+  MemoryMax and the process was OOM-killed every 10 h to 2.5 days, dropping
+  in-flight fetches. Measured locally against real sites through DataImpulse:
+  RSS rose 51 -> 148 MB over the first 100 fetches and stayed there. Each fetch
+  now opens and closes its own session, which is what it was getting anyway —
+  a new TLS handshake and a cookie jar that lives for the fetch and its
+  redirect chain — without the retained state.
 
 KEY FIX (profile probe, v1.1.0):
   Previously SUPPORTED_IMPERSONATE_PROFILES was a hand-maintained frozenset
@@ -141,7 +155,6 @@ import asyncio
 import json
 import logging
 import os
-from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -274,10 +287,6 @@ FALLBACK_IMPERSONATE_PROFILE = "chrome146"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Maximum number of concurrent (profile × domain × exit) session entries.
-# Each entry holds an open connection pool + TLS state + cookie jar.
-MAX_DOMAIN_SESSIONS = 80
-
 # Upstream budget when a request omits `timeout`. The Java caller always sends it
 # (scraper.fetcher.curl-cffi-sidecar.default-timeout-seconds, sized from measured fetch
 # durations), so this only matches that value rather than deciding it.
@@ -316,10 +325,8 @@ async def lifespan(_: FastAPI):
         except (asyncio.CancelledError, Exception):
             pass
 
-    await _domain_session_pool.close_all()
 
-
-app = FastAPI(title="curl-cffi-sidecar", version="1.4.0", lifespan=lifespan)
+app = FastAPI(title="curl-cffi-sidecar", version="1.5.0", lifespan=lifespan)
 
 # ── Fingerprint probe configuration ───────────────────────────────────────────
 
@@ -419,120 +426,26 @@ _SEC_FETCH_SITE: dict[ReferrerHint, str] = {
 }
 
 
-# ── Session pool ──────────────────────────────────────────────────────────────
+# ── Sessions ──────────────────────────────────────────────────────────────────
 
-def _proxy_exit_id(proxy_url: str | None) -> str:
+def _new_session(profile: str) -> AsyncSession:
     """
-    Derives the sticky-session identity from a DataImpulse proxy URL.
+    A session for one fetch, to be closed when the fetch ends.
 
-    DataImpulse encodes the session as the HTTP Basic-auth username:
-        baseuser__country-XX__session-XXXXXXXX
+    Not pooled: the Java caller sends a fresh DataImpulse session with every
+    fetch and rotates the profile between retries, so no two fetches could share
+    a session without replaying one exit's cookies on another — and a pool that
+    can never hit only holds finished sessions in memory (see KEY FIX v1.5.0).
 
-    Using the full username as the pool key dimension ensures:
-      - Cookie jars minted on exit-IP-A are never replayed on exit-IP-B.
-      - TLS session tickets (which carry IP context in some CDN implementations)
-        are not leaked across proxy rotations.
-      - When the Java layer calls ProxySessionManager.generateTargetedUsername()
-        with a new sticky session, the sidecar transparently creates a fresh
-        session rather than reusing state from the previous exit.
-
-    Fallback: "direct" when no proxy is configured (local / development mode).
+    extra_fp tls_permute_extensions: shuffle the ClientHello extension list on
+    every new TLS handshake. Modern Chrome randomises extension order per
+    connection; a static sequence is itself a fingerprint visible in raw
+    ClientHello inspection and in JA3.
     """
-    if not proxy_url:
-        return "direct"
-    parsed = urlparse(proxy_url)
-    return parsed.username or "direct"
-
-
-class DomainSessionPool:
-    """
-    LRU pool of curl_cffi AsyncSession objects keyed by
-    ``(impersonate_profile, domain, proxy_exit_id)``.
-
-    The three-dimensional key is the critical design decision:
-      - ``impersonate_profile``: each profile has its own TLS fingerprint;
-        sessions must not be shared across profiles.
-      - ``domain``: sessions accumulate domain-specific cookies and connection
-        state; mixing domains degrades both performance and stealth.
-      - ``proxy_exit_id``: a session belongs to a specific residential exit IP.
-        Reusing it on a different IP leaks identity signals across IPs.
-
-    Pool capacity is bounded by ``max_entries`` (LRU eviction) to prevent
-    unbounded memory growth under many active (profile × domain × session)
-    combinations.
-
-    Each session is constructed with ``extra_fp={"tls_permute_extensions": True}``
-    so that the ClientHello extension sequence varies per TLS handshake, matching
-    Chrome's per-connection randomisation behaviour. See module docstring for
-    the full rationale.
-    """
-
-    def __init__(self, max_entries: int = MAX_DOMAIN_SESSIONS) -> None:
-        self._pool: OrderedDict[tuple[str, str, str], AsyncSession] = OrderedDict()
-        self._max  = max_entries
-        self._lock = asyncio.Lock()
-
-    async def get_or_create(
-        self,
-        profile:   str,
-        domain:    str,
-        proxy_url: str | None,
-    ) -> AsyncSession:
-        """
-        Returns an existing session for (profile, domain, exit_id) or creates one.
-
-        ``proxy_url`` is the full proxy URL string (not just the exit_id), so
-        that the caller does not need to know about exit_id derivation.
-        The derivation is encapsulated in :func:`_proxy_exit_id`.
-        """
-        exit_id = _proxy_exit_id(proxy_url)
-        key     = (profile, domain, exit_id)
-
-        async with self._lock:
-            if key in self._pool:
-                self._pool.move_to_end(key)
-                log.debug("Session pool hit: profile=%s domain=%s exit=%s", *key)
-                return self._pool[key]
-
-            # LRU eviction: close and remove the least-recently-used entry.
-            if len(self._pool) >= self._max:
-                evicted_key, evicted_session = self._pool.popitem(last=False)
-                log.debug(
-                    "Session pool capacity reached (%d); evicting: profile=%s domain=%s exit=%s",
-                    self._max, *evicted_key,
-                )
-                try:
-                    await evicted_session.close()
-                except Exception as exc:
-                    log.warning("Error closing evicted session: %s", exc)
-
-            log.debug("Session pool miss — creating: profile=%s domain=%s exit=%s", *key)
-            # extra_fp tls_permute_extensions: shuffle the ClientHello extension
-            # list on every new TLS handshake. Modern Chrome randomises extension
-            # order per connection; a static sequence across requests from the
-            # same session is itself a fingerprint visible in raw ClientHello
-            # inspection and in JA3. This matches Chrome's actual behaviour.
-            session = AsyncSession(
-                impersonate=profile,
-                extra_fp={"tls_permute_extensions": True},
-            )
-            self._pool[key] = session
-            return session
-
-    async def close_all(self) -> None:
-        """Closes all sessions and clears the pool (called on application shutdown)."""
-        async with self._lock:
-            for session in self._pool.values():
-                try:
-                    await session.close()
-                except Exception as exc:
-                    log.warning("Error closing session during shutdown: %s", exc)
-            self._pool.clear()
-            log.info("Session pool cleared on shutdown.")
-
-
-# Module-level singleton — one pool shared across all request handlers.
-_domain_session_pool = DomainSessionPool()
+    return AsyncSession(
+        impersonate=profile,
+        extra_fp={"tls_permute_extensions": True},
+    )
 
 
 # ── TLS/JA4 fingerprint probe ─────────────────────────────────────────────────
@@ -594,9 +507,8 @@ async def _probe_one_profile(
     returns the observed fingerprint fields, including whether the ClientHello
     offered the post-quantum hybrid key-share group.
 
-    Uses a fresh one-off AsyncSession per call — not the DomainSessionPool —
-    to avoid polluting the pool with probe-only connection state and to ensure
-    each probe sees a clean TLS handshake unreused by any prior real fetch.
+    Uses a fresh one-off AsyncSession per call so each probe sees a clean TLS
+    handshake unreused by any real fetch.
 
     The proxy is a raw DataImpulse base URL (no session suffix); each probe
     request obtains its own residential exit via DataImpulse's default
@@ -879,24 +791,12 @@ async def execute_fetch(request_dto: CurlCffiFetchRequest) -> CurlCffiFetchRespo
     """
     Executes a single HTTP GET through curl_cffi with full TLS impersonation.
 
-    Session reuse is scoped to (impersonate, domain, proxy_exit_id) so that
-    cookie jars and TLS session tickets are never shared across different proxy
-    exit identities. A fresh Java ProxySessionManager sticky session maps to a
-    fresh sidecar session automatically, without any coordination signal needed
-    from the Java layer.
+    Each fetch runs in its own session, closed when the fetch ends, so cookie
+    jars and TLS session tickets are never shared across proxy exits and no
+    finished session stays in memory.
     """
     active_profile = _resolve_profile(request_dto.impersonate)
     hint           = _resolve_hint(request_dto.referrer_hint)
-
-    # Extract domain for session keying. netloc is preferred; raw URL is the
-    # fallback for malformed inputs that still parse as a netloc-less string.
-    domain = urlparse(request_dto.url).netloc or request_dto.url
-
-    session = await _domain_session_pool.get_or_create(
-        active_profile,
-        domain,
-        request_dto.proxy_url,
-    )
 
     context_headers = build_contextual_headers(request_dto.locale, hint)
 
@@ -906,53 +806,54 @@ async def execute_fetch(request_dto: CurlCffiFetchRequest) -> CurlCffiFetchRespo
         else None
     )
 
-    try:
-        response = await session.get(
-            request_dto.url,
-            headers=context_headers,
-            proxies=proxies,
-            timeout=request_dto.timeout,
-            allow_redirects=True,
-        )
+    async with _new_session(active_profile) as session:
+        try:
+            response = await session.get(
+                request_dto.url,
+                headers=context_headers,
+                proxies=proxies,
+                timeout=request_dto.timeout,
+                allow_redirects=True,
+            )
 
-        log.info(
-            "fetch OK  profile=%-10s status=%d url=%s",
-            active_profile, response.status_code, request_dto.url,
-        )
+            log.info(
+                "fetch OK  profile=%-10s status=%d url=%s",
+                active_profile, response.status_code, request_dto.url,
+            )
 
-        return CurlCffiFetchResponse(
-            html=response.text,
-            final_url=str(response.url),
-            status_code=response.status_code,
-        )
+            return CurlCffiFetchResponse(
+                html=response.text,
+                final_url=str(response.url),
+                status_code=response.status_code,
+            )
 
-    except Timeout:
-        # Transient: proxy routing delay or target slow to respond.
-        # The Java retry layer handles this — no traceback needed at this level.
-        log.warning(
-            "fetch TIMEOUT  profile=%-10s url=%s",
-            active_profile, request_dto.url,
-        )
-        return CurlCffiFetchResponse(html=None, final_url=None, status_code=502)
+        except Timeout:
+            # Transient: proxy routing delay or target slow to respond.
+            # The Java retry layer handles this — no traceback needed at this level.
+            log.warning(
+                "fetch TIMEOUT  profile=%-10s url=%s",
+                active_profile, request_dto.url,
+            )
+            return CurlCffiFetchResponse(html=None, final_url=None, status_code=502)
 
-    except RequestException as exc:
-        # Known curl_cffi transport error (connection reset, proxy error, etc.).
-        # Still recoverable via Java retry — log at ERROR without traceback.
-        log.error(
-            "fetch ERR  profile=%-10s url=%s  error=%s",
-            active_profile, request_dto.url, exc,
-        )
-        return CurlCffiFetchResponse(html=None, final_url=None, status_code=502)
+        except RequestException as exc:
+            # Known curl_cffi transport error (connection reset, proxy error, etc.).
+            # Still recoverable via Java retry — log at ERROR without traceback.
+            log.error(
+                "fetch ERR  profile=%-10s url=%s  error=%s",
+                active_profile, request_dto.url, exc,
+            )
+            return CurlCffiFetchResponse(html=None, final_url=None, status_code=502)
 
-    except Exception as exc:
-        # Unexpected — not a curl_cffi transport error. Full traceback warranted.
-        log.exception(
-            "fetch UNEXPECTED  profile=%-10s url=%s  error=%s",
-            active_profile, request_dto.url, exc,
-        )
-        # Return 502 so the Java retry / circuit-breaker path fires — do not
-        # raise an HTTP exception here as that bypasses the Java retry engine.
-        return CurlCffiFetchResponse(html=None, final_url=None, status_code=502)
+        except Exception as exc:
+            # Unexpected — not a curl_cffi transport error. Full traceback warranted.
+            log.exception(
+                "fetch UNEXPECTED  profile=%-10s url=%s  error=%s",
+                active_profile, request_dto.url, exc,
+            )
+            # Return 502 so the Java retry / circuit-breaker path fires — do not
+            # raise an HTTP exception here as that bypasses the Java retry engine.
+            return CurlCffiFetchResponse(html=None, final_url=None, status_code=502)
 
 
 # ── Profiles endpoint ─────────────────────────────────────────────────────────
