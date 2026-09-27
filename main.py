@@ -152,7 +152,7 @@ import uvicorn
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException, Timeout
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -278,7 +278,10 @@ FALLBACK_IMPERSONATE_PROFILE = "chrome146"
 # Each entry holds an open connection pool + TLS state + cookie jar.
 MAX_DOMAIN_SESSIONS = 80
 
-DEFAULT_TIMEOUT_SECONDS = 20
+# Upstream budget when a request omits `timeout`. The Java caller always sends it
+# (scraper.fetcher.curl-cffi-sidecar.default-timeout-seconds, sized from measured fetch
+# durations), so this only matches that value rather than deciding it.
+DEFAULT_TIMEOUT_SECONDS = 10
 
 # ── App / lifespan ────────────────────────────────────────────────────────────
 
@@ -354,7 +357,14 @@ class CurlCffiFetchRequest(BaseModel):
     Fields deliberately limited to what the sidecar actually needs —
     the Java layer owns retry state, backoff, session rotation, and
     challenge detection; these do not appear here.
+
+    Unknown fields are rejected (HTTP 422) rather than ignored. The Java side
+    once sent the timeout as ``timeout_seconds``; with the default ``ignore``
+    that name was dropped silently and every fetch ran on
+    DEFAULT_TIMEOUT_SECONDS for months. A mismatch now fails the first request.
     """
+    model_config = ConfigDict(extra="forbid")
+
     url:           str
     proxy_url:     str | None = Field(default=None)
     impersonate:   str        = Field(default=FALLBACK_IMPERSONATE_PROFILE)
