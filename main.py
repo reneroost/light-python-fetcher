@@ -1,7 +1,7 @@
 """
 curl_cffi sidecar — FastAPI service providing TLS-impersonating HTTP fetches.
 
-VERSION: 1.5.0  (one session per fetch — the session pool is gone)
+VERSION: 1.6.0  (curl_cffi 0.16.3 and the chrome150 profile)
 
 The sidecar's sole responsibility is low-level network execution:
   - Running each fetch in its own curl_cffi session with a browser-matching
@@ -35,6 +35,19 @@ KEY FIX (memory, v1.5.0):
   now opens and closes its own session, which is what it was getting anyway —
   a new TLS handshake and a cookie jar that lives for the fetch and its
   redirect chain — without the retained state.
+
+KEY FIX (stale Chrome fingerprint, v1.6.0):
+  Cloudflare learned the TLS fingerprint curl_cffi 0.15.0 sends for chrome145
+  and chrome146 (one JA4 for both, t13d1516h2_8daaf6152771_d8a2da3f94cd), and
+  www.ft.com began answering it with a challenge 403: ~20% of attempts until
+  2026-09-12, 45-70% after, ~80% from 2026-10-07, when FT lost 7 hours a day.
+  curl_cffi 0.16.3 adds chrome150, whose JA4 differs in the extension hash
+  (..._806a8c22fdea). On the same sticky DataImpulse exits, chrome150 passed
+  17/17 where chrome146 passed 1/17. Swapping only the User-Agent changed
+  nothing: chrome146's TLS with Chrome 150 headers passed 0/12, and chrome150's
+  TLS with Chrome 146 headers passed 11/12. phys.org showed the same split.
+  chrome145 is no longer a candidate: news-scraper dropped it from its
+  BrowserProfile enum, as it sent no fingerprint chrome146 does not.
 
 KEY FIX (profile probe, v1.1.0):
   Previously SUPPORTED_IMPERSONATE_PROFILES was a hand-maintained frozenset
@@ -191,8 +204,8 @@ log = logging.getLogger(__name__)
 #              the probe determines whether it is also valid for HTTP/1.1 and
 #              HTTP/2 fetches on the installed version.
 _PROFILE_CANDIDATES: frozenset[str] = frozenset({
+    "chrome150",
     "chrome146",
-    "chrome145",
     "firefox147",
     "safari2601",
     "safari260",
@@ -280,10 +293,10 @@ def _build_supported_profiles() -> frozenset[str]:
 SUPPORTED_IMPERSONATE_PROFILES: frozenset[str] = _build_supported_profiles()
 
 # Fallback profile for _resolve_profile() when the requested profile is absent
-# from SUPPORTED_IMPERSONATE_PROFILES. "chrome146" is always expected to be in
+# from SUPPORTED_IMPERSONATE_PROFILES. "chrome150" is always expected to be in
 # _PROFILE_CANDIDATES and to pass the probe. _resolve_profile() handles the
 # edge case where even this fallback is absent after the probe.
-FALLBACK_IMPERSONATE_PROFILE = "chrome146"
+FALLBACK_IMPERSONATE_PROFILE = "chrome150"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
