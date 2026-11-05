@@ -1,7 +1,7 @@
 """
 curl_cffi sidecar — FastAPI service providing TLS-impersonating HTTP fetches.
 
-VERSION: 1.6.0  (curl_cffi 0.16.3 and the chrome150 profile)
+VERSION: 1.7.0  (curl_cffi 0.17.0, bundling Brotli 1.2.1)
 
 The sidecar's sole responsibility is low-level network execution:
   - Running each fetch in its own curl_cffi session with a browser-matching
@@ -48,6 +48,18 @@ KEY FIX (stale Chrome fingerprint, v1.6.0):
   TLS with Chrome 146 headers passed 11/12. phys.org showed the same split.
   chrome145 is no longer a candidate: news-scraper dropped it from its
   BrowserProfile enum, as it sent no fingerprint chrome146 does not.
+
+KEY FIX (Brotli decoder, v1.7.0):
+  curl_cffi 0.16.3's libcurl-impersonate bundles Brotli 1.2.0, inside the
+  range (1.0.3-1.2.0) of CVE-2026-111497, "HTTP2Shell": an out-of-bounds write
+  in the decoder, with public RCE proofs of concept, exploited in the wild.
+  Every profile in use sends "br" in Accept-Encoding, and sites answer with it
+  (www.nytimes.com/trending/ does), so libcurl decodes third-party Brotli in
+  this process. curl_cffi 0.17.0 bundles Brotli 1.2.1. It also requires
+  certifi >= 2026.10.19, which drops the compromised eMudhra root that
+  2026.06.17 still trusted. The fingerprints are unchanged: chrome150,
+  safari2601, firefox147 and safari260 send the same JA4 and HTTP/2 hash on
+  both versions.
 
 KEY FIX (profile probe, v1.1.0):
   Previously SUPPORTED_IMPERSONATE_PROFILES was a hand-maintained frozenset
