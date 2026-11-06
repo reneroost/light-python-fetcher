@@ -1,7 +1,7 @@
 """
 curl_cffi sidecar — FastAPI service providing TLS-impersonating HTTP fetches.
 
-VERSION: 1.7.0  (curl_cffi 0.17.0, bundling Brotli 1.2.1)
+VERSION: 1.8.0  (curl_cffi 0.17.0; chrome151_macos and firefox153)
 
 The sidecar's sole responsibility is low-level network execution:
   - Running each fetch in its own curl_cffi session with a browser-matching
@@ -60,6 +60,21 @@ KEY FIX (Brotli decoder, v1.7.0):
   2026.06.17 still trusted. The fingerprints are unchanged: chrome150,
   safari2601, firefox147 and safari260 send the same JA4 and HTTP/2 hash on
   both versions.
+
+KEY FIX (aging browser versions, v1.8.0):
+  Paired on the same DataImpulse exits (one fresh exit per round, every
+  profile once in random order, 20 rounds), the Forbes list's DataDome passed
+  0-5% of fetches on every profile in use and ~85% on every target of a newer
+  browser version. It scores the version the User-Agent claims, not the
+  handshake: safari270 sends safari2601's handshake with a Version/27.0 UA and
+  passed 17/20 where safari2601 passed 0/20. www.ft.com's Cloudflare scores the
+  handshake instead, and refuses chrome152's new one (JA4 ..._cb7bf5808d99):
+  0/20 against chrome150's 19/20. chrome151_macos sends chrome150's handshake
+  with a Chrome/151 UA, so it passes both: FT 20/20, Forbes 17/20, and it lost
+  no round to chrome150 anywhere. firefox153 (JA4 t13d1617h2_86a278354501_...)
+  replaces firefox147: FT 20/20 vs 1/20, Forbes 17/20 vs 0/20, phys.org 14/20
+  vs 6/20; firefox155 matched it except on phys.org (2/20). On 33 other trend
+  routes every profile passed every round. chrome151_macos is the fallback.
 
 KEY FIX (profile probe, v1.1.0):
   Previously SUPPORTED_IMPERSONATE_PROFILES was a hand-maintained frozenset
@@ -215,9 +230,13 @@ log = logging.getLogger(__name__)
 # "firefox147" is probed: it was added with HTTP/3 fingerprints in v0.15.0;
 #              the probe determines whether it is also valid for HTTP/1.1 and
 #              HTTP/2 fetches on the installed version.
+# "chrome150" and "firefox147" stay until every news-scraper instance has
+#              moved to "chrome151_macos" and "firefox153"; see v1.8.0 above.
 _PROFILE_CANDIDATES: frozenset[str] = frozenset({
+    "chrome151_macos",
     "chrome150",
     "chrome146",
+    "firefox153",
     "firefox147",
     "safari2601",
     "safari260",
@@ -305,10 +324,10 @@ def _build_supported_profiles() -> frozenset[str]:
 SUPPORTED_IMPERSONATE_PROFILES: frozenset[str] = _build_supported_profiles()
 
 # Fallback profile for _resolve_profile() when the requested profile is absent
-# from SUPPORTED_IMPERSONATE_PROFILES. "chrome150" is always expected to be in
-# _PROFILE_CANDIDATES and to pass the probe. _resolve_profile() handles the
+# from SUPPORTED_IMPERSONATE_PROFILES. "chrome151_macos" is always expected to be
+# in _PROFILE_CANDIDATES and to pass the probe. _resolve_profile() handles the
 # edge case where even this fallback is absent after the probe.
-FALLBACK_IMPERSONATE_PROFILE = "chrome150"
+FALLBACK_IMPERSONATE_PROFILE = "chrome151_macos"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
